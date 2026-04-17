@@ -148,6 +148,33 @@ def health():
     return {"status": "ok", "utc": datetime.utcnow().isoformat()}
 
 
+@app.get("/status", dependencies=[Depends(require_api_key)])
+def status():
+    now = datetime.utcnow()
+    session_ready = _auto_client is not None
+    cache_valid = (
+        _moves_cache is not None
+        and _moves_cache_expires is not None
+        and now < _moves_cache_expires
+    )
+    return {
+        "session": {
+            "ready": session_ready,
+            "accounts": len(_auto_client.accounts) if session_ready else 0,
+            "credit_cards": len(_auto_client.credit_cards) if session_ready else 0,
+        },
+        "cache": {
+            "valid": cache_valid,
+            "expires": _moves_cache_expires.isoformat() if _moves_cache_expires else None,
+            "expires_in_seconds": (
+                int((_moves_cache_expires - now).total_seconds())
+                if cache_valid else None
+            ),
+            "move_count": _moves_cache["count"] if cache_valid else None,
+        },
+    }
+
+
 @app.get(
     "/moves",
     summary="CC moves (auto-auth)",
