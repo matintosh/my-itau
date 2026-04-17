@@ -19,7 +19,8 @@ python probe.py
 python test_login.py
 
 # 3. Run the API server
-uvicorn main:app --reload --port 8787
+# --host 0.0.0.0 is required so the iPhone can reach it over LAN
+uvicorn main:app --host 0.0.0.0 --port 8787
 ```
 
 ## API

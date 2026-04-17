@@ -17,7 +17,8 @@ transactions as JSON. Lives at `/Users/matintosh/dev/itau-uy-api`.
 
 ```bash
 cd /Users/matintosh/dev/itau-uy-api
-.venv/bin/uvicorn main:app --port 8787
+# --host 0.0.0.0 required so the iPhone can reach it over LAN
+.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8787
 ```
 
 Credentials and API key are read from `.env` (never committed).
