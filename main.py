@@ -19,7 +19,7 @@ import logging
 import os
 import secrets
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -52,6 +52,10 @@ app = FastAPI(
 
 _auto_client: Optional[ItauClient] = None
 _auto_lock = threading.Lock()
+
+_MOVES_TTL = timedelta(minutes=10)
+_moves_cache: Optional[dict] = None
+_moves_cache_expires: Optional[datetime] = None
 
 
 def _auto_login() -> ItauClient:
@@ -155,40 +159,49 @@ def health():
 )
 def get_moves(month: Optional[int] = None, year: Optional[int] = None):
     """
-    Returns moves for every credit card, grouped by card.
-    Use ?month=3&year=2026 to fetch a specific month.
-    Omit query params for the current month.
+    Returns first credit card moves. Current month is cached for 10 minutes.
+    Use ?month=3&year=2026 for a specific month (not cached).
     """
+    global _moves_cache, _moves_cache_expires
+
+    # Serve from cache when the request is for the current month and cache is fresh
+    now = datetime.utcnow()
+    is_current_month = month is None and year is None
+    if is_current_month and _moves_cache and _moves_cache_expires and now < _moves_cache_expires:
+        logger.info("Serving /moves from cache (expires %s)", _moves_cache_expires.strftime("%H:%M:%S"))
+        return _moves_cache
+
     client = get_auto_client()
+    card = client.credit_cards[0] if client.credit_cards else None
+    if not card:
+        raise HTTPException(status_code=404, detail="No credit cards found on this account")
 
-    results = []
-    for card in client.credit_cards:
-        card_hash = card.get("hash")
-        if not card_hash:
-            continue
-        try:
-            moves = client.get_credit_card_moves(card_hash, month, year)
-        except ItauSessionExpired:
-            client = refresh_auto_client()
-            moves = client.get_credit_card_moves(card_hash, month, year)
-        except Exception as e:
-            logger.exception("Error fetching moves for card %s", card_hash[:12])
-            moves = []
+    card_hash = card.get("hash")
+    try:
+        moves = client.get_credit_card_moves(card_hash, month, year)
+    except ItauSessionExpired:
+        client = refresh_auto_client()
+        moves = client.get_credit_card_moves(card_hash, month, year)
 
-        results.append({
-            "card": {
-                "hash": card_hash,
-                "brand": card.get("brand"),
-                "masked_number": card.get("masked_number"),
-                "holder": card.get("holder"),
-            },
-            "month": month,
-            "year": year,
-            "count": len(moves),
-            "moves": moves,
-        })
+    result = {
+        "card": {
+            "hash": card_hash,
+            "brand": card.get("brand"),
+            "masked_number": card.get("masked_number"),
+            "holder": card.get("holder"),
+        },
+        "month": month,
+        "year": year,
+        "count": len(moves),
+        "moves": moves,
+    }
 
-    return {"cards": results}
+    if is_current_month:
+        _moves_cache = result
+        _moves_cache_expires = now + _MOVES_TTL
+        logger.info("Cached /moves until %s", _moves_cache_expires.strftime("%H:%M:%S"))
+
+    return result
 
 
 @app.get(
