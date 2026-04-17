@@ -1,12 +1,13 @@
 ---
-name: itau-uy-api
+
+## name: itau-uy-api
+
 description: >-
   Interact with the local Itaú Uruguay scraper API to fetch credit card
   transactions. Use when importing Itaú transactions into the app, querying
   recent CC moves, checking API status, or integrating itaulink.com.uy data
   into project-f. Triggers: Itaú, itaulink, credit card import, CC moves,
   Itaú transactions, fetch bank data.
----
 
 # Itaú UY API
 
@@ -27,14 +28,16 @@ Credentials and API key are read from `.env` (never committed).
 Base: `http://localhost:8787`  
 All requests require `x-api-key: <API_KEY>` from `.env`.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Liveness check — no auth required |
-| GET | `/status` | Session + cache state |
-| GET | `/cards` | List credit cards with hashes |
-| GET | `/moves` | Current-month moves for first card — **cached 10 min** |
-| GET | `/moves?month=4&year=2026` | Specific month (not cached) |
-| GET | `/moves/{hash}` | Moves for a specific card hash |
+
+| Method | Path                       | Description                                            |
+| ------ | -------------------------- | ------------------------------------------------------ |
+| GET    | `/health`                  | Liveness check — no auth required                      |
+| GET    | `/status`                  | Session + cache state                                  |
+| GET    | `/cards`                   | List credit cards with hashes                          |
+| GET    | `/moves`                   | Current-month moves for first card — **cached 10 min** |
+| GET    | `/moves?month=4&year=2026` | Specific month (not cached)                            |
+| GET    | `/moves/{hash}`            | Moves for a specific card hash                         |
+
 
 ## Typical response — `/moves`
 
@@ -73,14 +76,16 @@ Then pass `parsed` to `upsertTransactions()` from `transaction.queries.ts`.
 
 ## Key field mapping (move → ParsedItauTransaction)
 
-| Itaú field | App field | Notes |
-|---|---|---|
-| `nombreComercio` | `payee` | Trim whitespace |
-| `fecha.{year,monthOfYear,dayOfMonth}` | `transactionDate` | YYYY-MM-DD |
-| `importe` | `originalAmountCents` | `Math.round(abs * 100)` |
-| `moneda` | `originalCurrency` | "Pesos" → `UYU`, else `USD` |
-| `idCupon` | `clientId` | via `couponToUuid()` in parser |
-| `nroCuota` / `cantCuotas` | `memo` | "Cuota 1/3" style |
+
+| Itaú field                            | App field             | Notes                          |
+| ------------------------------------- | --------------------- | ------------------------------ |
+| `nombreComercio`                      | `payee`               | Trim whitespace                |
+| `fecha.{year,monthOfYear,dayOfMonth}` | `transactionDate`     | YYYY-MM-DD                     |
+| `importe`                             | `originalAmountCents` | `Math.round(abs * 100)`        |
+| `moneda`                              | `originalCurrency`    | "Pesos" → `UYU`, else `USD`    |
+| `idCupon`                             | `clientId`            | via `couponToUuid()` in parser |
+| `nroCuota` / `cantCuotas`             | `memo`                | "Cuota 1/3" style              |
+
 
 ## Session & cache behaviour
 
@@ -95,3 +100,4 @@ Then pass `parsed` to `upsertTransactions()` from `transaction.queries.ts`.
 cd /Users/matintosh/dev/itau-uy-api
 .venv/bin/python test_login.py   # requires .env with real credentials
 ```
+

@@ -170,7 +170,7 @@ def status():
                 int((_moves_cache_expires - now).total_seconds())
                 if cache_valid else None
             ),
-            "move_count": _moves_cache["count"] if cache_valid else None,
+            "move_count": len((_moves_cache or {}).get("data", {}).get("datos", {}).get("datosMovimientos", {}).get("movimientos", [])) if cache_valid else None,
         },
     }
 
@@ -191,7 +191,6 @@ def get_moves(month: Optional[int] = None, year: Optional[int] = None):
     """
     global _moves_cache, _moves_cache_expires
 
-    # Serve from cache when the request is for the current month and cache is fresh
     now = datetime.utcnow()
     is_current_month = month is None and year is None
     if is_current_month and _moves_cache and _moves_cache_expires and now < _moves_cache_expires:
@@ -205,30 +204,17 @@ def get_moves(month: Optional[int] = None, year: Optional[int] = None):
 
     card_hash = card.get("hash")
     try:
-        moves = client.get_credit_card_moves(card_hash, month, year)
+        payload = client.get_credit_card_payload(card_hash, month, year)
     except ItauSessionExpired:
         client = refresh_auto_client()
-        moves = client.get_credit_card_moves(card_hash, month, year)
-
-    result = {
-        "card": {
-            "hash": card_hash,
-            "brand": card.get("brand"),
-            "masked_number": card.get("masked_number"),
-            "holder": card.get("holder"),
-        },
-        "month": month,
-        "year": year,
-        "count": len(moves),
-        "moves": moves,
-    }
+        payload = client.get_credit_card_payload(card_hash, month, year)
 
     if is_current_month:
-        _moves_cache = result
+        _moves_cache = payload
         _moves_cache_expires = now + _MOVES_TTL
         logger.info("Cached /moves until %s", _moves_cache_expires.strftime("%H:%M:%S"))
 
-    return result
+    return payload
 
 
 @app.get(
@@ -241,24 +227,18 @@ def get_moves_for_card(
     month: Optional[int] = None,
     year: Optional[int] = None,
 ):
-    """Fetch moves for a single card hash. Auto-refreshes session on expiry."""
+    """Raw itaulink_msg payload for a specific card. Same shape as itau-example.json."""
     client = get_auto_client()
     try:
-        moves = client.get_credit_card_moves(card_hash, month, year)
+        payload = client.get_credit_card_payload(card_hash, month, year)
     except ItauSessionExpired:
         client = refresh_auto_client()
-        moves = client.get_credit_card_moves(card_hash, month, year)
+        payload = client.get_credit_card_payload(card_hash, month, year)
     except Exception as e:
         logger.exception("Error fetching CC moves")
         raise HTTPException(status_code=502, detail=str(e))
 
-    return {
-        "card_hash": card_hash,
-        "month": month,
-        "year": year,
-        "count": len(moves),
-        "moves": moves,
-    }
+    return payload
 
 
 @app.get(

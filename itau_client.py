@@ -86,6 +86,40 @@ class ItauClient:
         self._load_dashboard()
         self._load_credit_cards()
 
+    def get_credit_card_payload(
+        self,
+        card_hash: str,
+        month: Optional[int] = None,
+        year: Optional[int] = None,
+    ) -> dict:
+        """
+        Returns the raw itaulink_msg content exactly as Itaú sends it:
+          { header: {...}, data: { datos: { tarjetaId, datosMovimientos: { movimientos: [...] } } } }
+        This matches the shape of itau-example.json.
+        """
+        today = date.today()
+        month = month or today.month
+        year = year or today.year
+        year_2d = year - 2000 if year > 2000 else year
+
+        if month == today.month and year == today.year:
+            r = self._ajax_post(
+                f"{TRX}/tarjetas/credito/{card_hash}/movimientos_actuales/{_CC_MOVES_SUFFIX}",
+                b"{}",
+            )
+        else:
+            r = self._ajax_post(
+                f"{TRX}/tarjetas/credito/{card_hash}/movimientos_mes/{month}/{year_2d:02d}",
+                b"{}",
+            )
+        self._check_session(r)
+        r.raise_for_status()
+        data = r.json()
+        # Unwrap the outer itaulink_msg envelope — return its content directly
+        if isinstance(data, dict) and "itaulink_msg" in data:
+            return data["itaulink_msg"]
+        return data
+
     def get_credit_card_moves(
         self,
         card_hash: str,
