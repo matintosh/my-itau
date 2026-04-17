@@ -254,18 +254,24 @@ class ItauClient:
 
     @staticmethod
     def _normalise_card(raw: dict) -> dict:
+        expiry = raw.get("fechaVencimiento") or {}
+        expiry_str = None
+        if expiry.get("monthOfYear") and expiry.get("year"):
+            expiry_str = f"{expiry['monthOfYear']:02d}/{expiry['year']}"
+
         return {
             "type": "credit_card",
             "brand": raw.get("sello"),
             "description": raw.get("descripcion"),
-            "last_digits": raw.get("nroTarjeta") or raw.get("ultimosDigitos"),
-            "expiry": raw.get("fechaVencimiento"),
+            "masked_number": raw.get("nroTitularTarjetaWithMask"),
+            "holder": raw.get("nombreTitular"),
+            "expiry": expiry_str,
             "hash": raw.get("hash"),
-            "customer_hash": raw.get("hashCustomer"),
-            "currency": raw.get("moneda"),
-            "limit": raw.get("limite"),
-            "balance": raw.get("saldo"),
-            "raw": raw,  # keep full object for debugging
+            "currency": raw.get("monedaLimite"),
+            "limit": raw.get("limiteDeCredito"),
+            "account_number": raw.get("nroCuenta"),
+            "status": raw.get("estado"),
+            "raw": raw,
         }
 
     # ------------------------------------------------------------------
