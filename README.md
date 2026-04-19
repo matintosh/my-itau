@@ -1,7 +1,7 @@
 # itau-uy-api
 
-Thin HTTP wrapper around [itaulink.com.uy](https://www.itaulink.com.uy) for personal use.  
-Reverse-engineered from [GonzaloRizzo/Itau-API](https://github.com/GonzaloRizzo/Itau-API) + fresh traffic analysis.
+Thin HTTP wrapper around [itaulink.com.uy](https://www.itaulink.com.uy) for personal use.
+Built via traffic analysis of the Itaú Uruguay web app.
 
 ## Quick start
 
@@ -19,7 +19,7 @@ python probe.py
 python test_login.py
 
 # 3. Run the API server
-# --host 0.0.0.0 is required so the iPhone can reach it over LAN
+# --host 0.0.0.0 required to reach it over LAN
 uvicorn main:app --host 0.0.0.0 --port 8787
 ```
 
@@ -34,21 +34,18 @@ All requests require `X-Api-Key: <your API_KEY>` header.
 Returns `session_token`, `accounts`, and `credit_cards`.
 
 ### GET /credit-cards
-`X-Session-Token: <token>` → list of credit cards with hashes
+`X-Session-Token: <token>` → list of credit cards with hashes.
 
 ### GET /credit-cards/{hash}/moves?month=4&year=2025
-Returns raw moves **and** the same `data.datos.datosMovimientos.movimientos` envelope
-the mobile app's `itau-parser.ts` expects.
+Returns raw moves payload.
 
 ### GET /accounts/{hash}/moves?month=4&year=2025
-Raw bank-account moves.
+Returns raw bank-account moves.
 
 ### DELETE /logout
 
 ## Notes
 
-- Sessions are in-memory — restart the server to clear them.
-- The Itaú session cookie lasts ~20 min; after that, POST /login again.
-- Password is sent in plaintext over HTTPS to Itaú's servers (same as the browser).
-- For the mobile app integration: `POST /login`, grab the first credit card `hash`, then
-  `GET /credit-cards/{hash}/moves` — feed the `data` field to `parseItauJson()`.
+- Sessions are in-memory — restart to clear.
+- Itaú session cookie lasts ~20 min; re-authenticate via `POST /login` after expiry.
+- Password sent in plaintext over HTTPS to Itaú's servers (same as the browser).
