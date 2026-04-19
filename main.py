@@ -24,6 +24,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from itau_client import ItauAuthError, ItauClient, ItauSessionExpired
@@ -44,6 +45,13 @@ app = FastAPI(
     title="Itaú UY API",
     description="Thin wrapper around itaulink.com.uy for personal use.",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -208,6 +216,9 @@ def get_moves(month: Optional[int] = None, year: Optional[int] = None):
     except ItauSessionExpired:
         client = refresh_auto_client()
         payload = client.get_credit_card_payload(card_hash, month, year)
+    except Exception as e:
+        logger.exception("Error fetching CC moves for month=%s year=%s", month, year)
+        raise HTTPException(status_code=502, detail=str(e))
 
     if is_current_month:
         _moves_cache = payload
