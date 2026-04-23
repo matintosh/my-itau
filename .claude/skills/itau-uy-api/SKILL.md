@@ -10,69 +10,88 @@ description: >-
 
 # Itaú UY API
 
-Local Python/FastAPI service that scrapes itaulink.com.uy and exposes CC
-transactions as JSON. Lives at `/Users/matintosh/dev/itau-uy-api`.
+Local Python/FastAPI + MCP service that scrapes itaulink.com.uy and exposes
+CC and account transactions as JSON. Lives at `/Users/matintosh/dev/itau-uy-api`.
 
 ## Start the server
 
 ```bash
 cd /Users/matintosh/dev/itau-uy-api
-# --host 0.0.0.0 required so the iPhone can reach it over LAN
-.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8787
+.venv/bin/my-itau serve              # binds 0.0.0.0:8787
+.venv/bin/my-itau serve --port 9000  # custom port
 ```
 
-Credentials and API key are read from `.env` (never committed).
+Credentials are read from the system keyring (macOS Keychain) or `.env`.
+API key is required — set via `my-itau config` or `API_KEY` env var.
 
 ## Endpoints
 
-Base: `http://localhost:8787`  
-All requests require `x-api-key: <API_KEY>` from `.env`.
+Base: `http://localhost:8787`
+All requests (except `/health`) require `X-Api-Key: <API_KEY>`.
+
+### Auto-session (uses stored credentials)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Liveness check — no auth required |
+| GET | `/health` | Liveness — no auth |
 | GET | `/status` | Session + cache state |
-| GET | `/cards` | List credit cards with hashes |
-| GET | `/moves` | Current-month moves for first card — **cached 10 min** |
-| GET | `/moves?month=4&year=2026` | Specific month (not cached) |
-| GET | `/moves/{hash}` | Moves for a specific card hash |
+| GET | `/cards` | Credit cards with hashes |
+| GET | `/accounts` | Bank accounts with hashes |
+| GET | `/moves` | CC moves, default card, current month |
+| GET | `/moves?month=4&year=2026` | Specific month |
+| GET | `/moves/{card_hash}` | Specific card |
+
+### Open Banking (Berlin Group) — `/v1`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/cards` | Cards (OB format) |
+| GET | `/v1/cards/{id}/transactions` | CC transactions |
+| GET | `/v1/accounts` | Accounts (OB format) |
+| GET | `/v1/accounts/{id}/transactions` | Account transactions |
+
+All `/v1` responses use Berlin Group shapes: ISO 8601 dates, ISO 4217 currency
+codes (`UYU`, `USD`), amounts as strings with two decimal places, negative for debits.
+
+### Manual session (multi-user / scripted)
+
+```
+POST   /login                         → { session_token, accounts, credit_cards }
+GET    /credit-cards/{hash}/moves     X-Session-Token required
+GET    /account-moves/{hash}          X-Session-Token required
+DELETE /logout
+```
 
 ## Typical response — `/moves`
 
 ```json
 {
-  "card": { "brand": "VISA", "masked_number": "**** 4207", "holder": "MARTINEZ AGUERR, MATIAS NAH", "hash": "ecffb81c..." },
-  "month": null,
-  "year": null,
-  "count": 56,
-  "moves": [
-    {
-      "nombreComercio": "TELEPEAJE",
-      "importe": 162,
-      "moneda": "Pesos",
-      "idCupon": "58317032",
-      "nroCuota": 1,
-      "cantCuotas": 1,
-      "fecha": { "year": 2026, "monthOfYear": 4, "dayOfMonth": 7 },
-      "tarjeta": { "sello": "VISA", "nroTitularTarjetaWithMask": "**** 4094" }
-    }
-  ]
+  "transactions": {
+    "booked": [
+      {
+        "transactionId": "58317032",
+        "bookingDate": "2026-04-07",
+        "transactionAmount": { "amount": "-162.00", "currency": "UYU" },
+        "creditorName": "TELEPEAJE",
+        "remittanceInformationUnstructured": "",
+        "proprietaryBankTransactionCode": "compra"
+      }
+    ]
+  }
 }
 ```
 
+Payment entries (card bill payments) are excluded automatically.
+Installment info lives in `cardTransaction.installments.{current,total}`.
+
 ## Feeding moves into the mobile app
 
-The move objects are in the shape `parseItauJson()` in
-`apps/mobile/src/lib/itau-parser.ts` expects. Wrap any array of moves like:
+The `/moves` response is normalized (Berlin Group format). The mobile app's
+`parseItauJson()` in `apps/mobile/src/lib/itau-parser.ts` expects the raw
+Itaú shape — use the raw `moves` array from `my-itau moves --json` instead,
+or adapt the parser to consume the OB format.
 
-```ts
-const raw = { data: { datos: { datosMovimientos: { movimientos: moves } } } }
-const parsed = parseItauJson(raw)
-```
-
-Then pass `parsed` to `upsertTransactions()` from `transaction.queries.ts`.
-
-## Key field mapping (move → ParsedItauTransaction)
+Key field mapping (raw Itaú move → ParsedItauTransaction):
 
 | Itaú field | App field | Notes |
 |---|---|---|
@@ -83,16 +102,27 @@ Then pass `parsed` to `upsertTransactions()` from `transaction.queries.ts`.
 | `idCupon` | `clientId` | via `couponToUuid()` in parser |
 | `nroCuota` / `cantCuotas` | `memo` | "Cuota 1/3" style |
 
+## CLI (quick reference)
+
+```bash
+.venv/bin/my-itau moves                        # default card, current month
+.venv/bin/my-itau moves --month 3 --year 2026
+.venv/bin/my-itau moves --json                 # raw JSON to stdout
+.venv/bin/my-itau cards
+.venv/bin/my-itau accounts
+.venv/bin/my-itau account-moves <hash>
+.venv/bin/my-itau doctor                       # health check
+```
+
 ## Session & cache behaviour
 
-- First request auto-logs in (~3 s); session is reused for ~20 min.
-- `/moves` (current month, no query params) is cached 10 min in-process.
-- On session expiry the client re-logs automatically — callers never see it.
+- First request auto-logs in (~3 s); session reused for ~20 min.
+- On session expiry the server re-authenticates automatically.
 - Historic months (`?month=X&year=Y`) always hit Itaú live; no cache.
 
 ## Run integration test
 
 ```bash
 cd /Users/matintosh/dev/itau-uy-api
-.venv/bin/python test_login.py   # requires .env with real credentials
+.venv/bin/python test_login.py   # requires credentials in keyring or .env
 ```
