@@ -32,7 +32,7 @@ Reverse-engineered from live traffic against [itaulink.com.uy](https://www.itaul
 ## Install
 
 ```bash
-git clone https://github.com/matintosh/itau-uy-api
+git clone https://github.com/matintosh/my-itau
 cd itau-uy-api
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
@@ -412,7 +412,7 @@ Raw Itaú fields → Berlin Group equivalents:
 ### Setup
 
 ```bash
-git clone https://github.com/matintosh/itau-uy-api
+git clone https://github.com/matintosh/my-itau
 cd itau-uy-api
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
