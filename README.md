@@ -453,3 +453,8 @@ python test_login.py
 2. Capture a fresh login in browser devtools (Network tab, filter `/trx/`).
 3. Compare the new form fields / redirect URLs against `client.py:_do_login`.
 4. Update `_do_login` and `_parse_dashboard` accordingly.
+
+
+## Inspiration
+This tool was inspired by https://github.com/GonzaloRizzo/Itau-API
+
