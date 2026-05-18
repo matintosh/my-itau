@@ -590,6 +590,71 @@ def moves(
 
 
 # ---------------------------------------------------------------------------
+# authorizations
+# ---------------------------------------------------------------------------
+
+@app.command()
+def authorizations(
+    card:      Optional[str] = typer.Option(None, "--card", "-c", help="Filter to a specific card hash"),
+    json_mode: bool          = typer.Option(False, "--json",      help="Machine-readable output"),
+) -> None:
+    """Approved pending credit card authorizations (current period, all cards by default)."""
+    client = _get_client(json_mode)
+
+    if not client.credit_cards:
+        if json_mode:
+            _json_error("no credit cards found", 1)
+        err.print("[red]No credit cards found.[/red]")
+        raise typer.Exit(1)
+
+    with _status.status("Fetching authorizations..."):
+        try:
+            auth_list = client.get_pending_authorizations(card or None)
+        except Exception as e:
+            if json_mode:
+                _json_error(str(e), 1)
+            err.print(f"[red]Error:[/red] {escape(str(e))}")
+            raise typer.Exit(1)
+
+    if json_mode:
+        _json_out(auth_list)
+
+    from .normalizers import pending_authorization
+    normalized = [pending_authorization(a) for a in auth_list]
+
+    title = "pending authorizations" + (f" — {card[:16]}…" if card else " — all cards")
+    table = Table(title=title, show_lines=False)
+    table.add_column("Date", style="cyan", no_wrap=True)
+    table.add_column("Card", style="dim")
+    table.add_column("Merchant")
+    table.add_column("Amount", justify="right", style="bold")
+    table.add_column("Cur", style="dim")
+
+    for raw, norm in zip(auth_list, normalized):
+        ta = norm.get("transactionAmount") or {}
+        masked = escape((raw.get("tarjeta") or {}).get("nroTitularTarjetaWithMask") or "")
+        table.add_row(
+            escape(norm.get("bookingDate") or ""),
+            masked,
+            escape(norm.get("creditorName") or ""),
+            escape(ta.get("amount") or ""),
+            escape(ta.get("currency") or ""),
+        )
+
+    console.print(table)
+
+    totals: dict[str, float] = {}
+    for norm in normalized:
+        ta = norm.get("transactionAmount") or {}
+        cur = ta.get("currency") or "?"
+        totals[cur] = round(totals.get(cur, 0.0) + abs(float(ta.get("amount") or 0)), 2)
+
+    for cur, total in totals.items():
+        console.print(f"  Total {escape(cur)}: [bold]{total:,.2f}[/bold]")
+    console.print(f"  [dim]{len(normalized)} pending authorizations[/dim]\n")
+
+
+# ---------------------------------------------------------------------------
 # account-moves
 # ---------------------------------------------------------------------------
 

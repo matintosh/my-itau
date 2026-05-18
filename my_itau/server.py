@@ -45,6 +45,7 @@ from .normalizers import (
     card_to_ob,
     cc_transaction,
     is_payment,
+    pending_authorization,
 )
 
 logging.basicConfig(
@@ -218,6 +219,25 @@ def get_summary(
 
 
 @mcp.tool()
+def get_authorizations(card_hash: Optional[str] = None) -> list[dict]:
+    """
+    Approved pending credit card authorizations in Open Banking format.
+    These are charges authorized but not yet settled as booked transactions.
+    importe may be 0 for pre-authorizations without a confirmed amount.
+
+    Args:
+        card_hash: resourceId from get_cards() to filter to one card.
+                   Omit to get all cards' pending authorizations.
+    """
+    client = get_auto_client()
+    try:
+        auths = client.get_pending_authorizations(card_hash)
+    except ItauSessionExpired:
+        auths = refresh_auto_client().get_pending_authorizations(card_hash)
+    return [pending_authorization(a) for a in auths]
+
+
+@mcp.tool()
 def get_accounts() -> list[dict]:
     """List bank accounts in Open Banking format (Berlin Group)."""
     return [account_to_ob(a) for a in get_auto_client().accounts]
@@ -351,6 +371,32 @@ def rest_get_cards():
     return {"paymentAccounts": [card_to_ob(c) for c in get_auto_client().credit_cards]}
 
 
+@app.get("/authorizations", dependencies=[Depends(require_api_key)])
+def rest_get_authorizations():
+    """Pending authorizations for all cards (OB format)."""
+    client = get_auto_client()
+    try:
+        auths = client.get_pending_authorizations()
+    except ItauSessionExpired:
+        auths = refresh_auto_client().get_pending_authorizations()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"transactions": {"pending": [pending_authorization(a) for a in auths]}}
+
+
+@app.get("/authorizations/{card_hash}", dependencies=[Depends(require_api_key)])
+def rest_get_authorizations_for_card(card_hash: str):
+    """Pending authorizations filtered to a specific card."""
+    client = get_auto_client()
+    try:
+        auths = client.get_pending_authorizations(card_hash)
+    except ItauSessionExpired:
+        auths = refresh_auto_client().get_pending_authorizations(card_hash)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"transactions": {"pending": [pending_authorization(a) for a in auths]}}
+
+
 @app.get("/accounts", dependencies=[Depends(require_api_key)])
 def rest_get_accounts():
     return {"accounts": [account_to_ob(a) for a in get_auto_client().accounts]}
@@ -482,6 +528,19 @@ def v1_card_transactions(
             "booked": [cc_transaction(m) for m in moves if not is_payment(m)]
         }
     }
+
+
+@v1.get("/cards/{card_id}/authorizations")
+def v1_card_authorizations(card_id: str):
+    """Berlin Group: pending authorizations for a card."""
+    client = get_auto_client()
+    try:
+        auths = client.get_pending_authorizations(card_id)
+    except ItauSessionExpired:
+        auths = refresh_auto_client().get_pending_authorizations(card_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"transactions": {"pending": [pending_authorization(a) for a in auths]}}
 
 
 app.include_router(v1)

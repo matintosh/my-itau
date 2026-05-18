@@ -114,6 +114,32 @@ def cc_transaction(m: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Pending authorization
+# ---------------------------------------------------------------------------
+
+def pending_authorization(m: dict) -> dict:
+    """Raw Itaú pending authorization → Berlin Group transaction (pending status).
+
+    Differences from cc_transaction: uses nroReserva as transactionId,
+    no remittanceInformationUnstructured, no installments. importe may be 0
+    for pre-authorizations without a final amount yet.
+    """
+    cur = currency_code(m.get("moneda") or "")
+    return {
+        "transactionId": str(m.get("nroReserva") or ""),
+        "bookingDate": fmt_date(m.get("fecha")),
+        "transactionAmount": {
+            "amount": _amt(m.get("importe"), negate=True),
+            "currency": cur,
+        },
+        "creditorName": m.get("nombreComercio") or "",
+        "remittanceInformationUnstructured": "",
+        "proprietaryBankTransactionCode": m.get("tipo") or "",
+        "status": "pending",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Account transaction
 # ---------------------------------------------------------------------------
 

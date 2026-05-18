@@ -133,6 +133,33 @@ class ItauClient:
             return self._fetch_cc_current(card_hash)
         return self._fetch_cc_historic(card_hash, month, year_2d)
 
+    def get_pending_authorizations(self, card_hash: Optional[str] = None) -> list[dict]:
+        """Approved pending authorizations (current period).
+
+        card_hash: if provided, filters to that card only. If None, returns all
+        cards on the account (the endpoint always returns account-wide data).
+        Any card hash on the account can be used as the URL key.
+        """
+        url_hash = card_hash or (self.credit_cards[0]["hash"] if self.credit_cards else "")
+        if not url_hash:
+            return []
+        url = f"{TRX}/tarjetas/credito/{url_hash}/autorizaciones_pendientes"
+        r = self._ajax_post(url, b"{}")
+        self._check_session(r)
+        r.raise_for_status()
+        data = r.json()
+        auths = (
+            data.get("itaulink_msg", data)
+                .get("data", {})
+                .get("datos", {})
+                .get("datosAutorizaciones", {})
+                .get("autorizaciones", [])
+        )
+        approved = [a for a in auths if a.get("aprobada")]
+        if card_hash:
+            approved = [a for a in approved if a.get("tarjeta", {}).get("hash") == card_hash]
+        return approved
+
     def get_account_moves(
         self,
         account_hash: str,
