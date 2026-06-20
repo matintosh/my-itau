@@ -174,6 +174,53 @@ def account_transaction(m: dict, fallback_currency: str = "") -> dict:
     return result
 
 
+_DEBIT_CREDIT = {"D": "DBIT", "C": "CRDT"}
+
+
+def account_transaction_signed(m: dict, fallback_currency: str = "") -> dict:
+    """Raw Itaú account move → Berlin Group transaction with a *signed* amount.
+
+    Distinguishes money in vs out using the raw ``tipo`` field:
+      - ``tipo`` 'D' (débito / out)   → negative amount, creditDebitIndicator 'DBIT'
+      - ``tipo`` 'C' (crédito / in)   → positive amount, creditDebitIndicator 'CRDT'
+
+    Unlike :func:`account_transaction` (kept for backwards compatibility, always
+    positive), this uses the raw ``id`` for transactionId and merges
+    ``descripcionAdicional`` into the remittance text.
+
+    fallback_currency: ISO 4217 code to use when the move has no moneda field
+    (account moves don't carry currency — pass it from the account object).
+    """
+    fecha = m.get("fecha") or m.get("fechaMovimiento") or m.get("fechaContable")
+    cur = currency_code(m.get("moneda") or "") or currency_code(fallback_currency)
+    tipo = (m.get("tipo") or "").upper()
+    magnitude = abs(float(m.get("importe") or m.get("monto") or 0))
+    signed = -magnitude if tipo == "D" else magnitude
+
+    desc = m.get("descripcion") or m.get("nombreComercio") or m.get("concepto") or ""
+    extra = m.get("descripcionAdicional") or ""
+    remittance = f"{desc.strip()} {extra.strip()}".strip() if extra.strip() else desc.strip()
+
+    result: dict = {
+        "transactionId": str(m.get("id") or m.get("idMovimiento") or m.get("nroMovimiento") or ""),
+        "bookingDate": fmt_date(fecha) if isinstance(fecha, dict) else (str(fecha) if fecha else ""),
+        "transactionAmount": {
+            "amount": f"{signed:.2f}",
+            "currency": cur,
+        },
+        "creditDebitIndicator": _DEBIT_CREDIT.get(tipo, ""),
+        "remittanceInformationUnstructured": remittance,
+    }
+
+    if m.get("saldo") is not None:
+        result["balanceAfterTransaction"] = {
+            "balanceAmount": {"amount": f"{float(m['saldo']):.2f}", "currency": cur},
+            "balanceType": "interimBooked",
+        }
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Card (payment instrument)
 # ---------------------------------------------------------------------------

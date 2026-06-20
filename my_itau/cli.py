@@ -725,6 +725,259 @@ def account_moves(
 
 
 # ---------------------------------------------------------------------------
+# card  (single-card bundle: meta + moves + pending auths + summary)
+# ---------------------------------------------------------------------------
+
+@app.command()
+def card(
+    card_hash: Optional[str] = typer.Argument(None, help="Card hash (omit to use default / pick)"),
+    month: Optional[int]     = typer.Option(None, "--month", "-m", help="Month 1-12"),
+    year:  Optional[int]     = typer.Option(None, "--year",  "-y", help="Year e.g. 2026"),
+    json_mode: bool          = typer.Option(False, "--json",       help="Machine-readable output"),
+) -> None:
+    """Single card bundle: metadata + transactions + pending auths + spend summary."""
+    from .normalizers import cc_transaction, is_payment, pending_authorization, card_to_ob, currency_code
+
+    client = _get_client(json_mode)
+    if not client.credit_cards:
+        if json_mode:
+            _json_error("no credit cards found", 1)
+        err.print("[red]No credit cards found.[/red]")
+        raise typer.Exit(1)
+
+    hash_ = card_hash or _resolve_card_hash(client, None)
+    card_obj = next((c for c in client.credit_cards if c["hash"] == hash_), None)
+    if card_obj is None:
+        if json_mode:
+            _json_error(f"no card with hash {hash_}", 1)
+        err.print(f"[red]No card with hash {escape(hash_)}.[/red]")
+        raise typer.Exit(1)
+
+    with _status.status("Fetching card..."):
+        try:
+            move_list = client.get_credit_card_moves(hash_, month, year)
+            auth_list = client.get_pending_authorizations(hash_)
+        except ItauSessionExpired:
+            if json_mode:
+                _json_error("session expired", 1)
+            err.print("[red]Session expired.[/red]")
+            raise typer.Exit(1)
+        except Exception as e:
+            if json_mode:
+                _json_error(str(e), 1)
+            err.print(f"[red]Error:[/red] {escape(str(e))}")
+            raise typer.Exit(1)
+
+    booked = [m for m in move_list if not is_payment(m)]
+    totals: dict[str, float] = {}
+    for m in booked:
+        cur = currency_code(m.get("moneda") or "")
+        totals[cur] = round(totals.get(cur, 0.0) + abs(float(m.get("importe") or 0)), 2)
+
+    if json_mode:
+        _json_out({
+            "card": card_to_ob(card_obj),
+            "transactions": {
+                "booked": [cc_transaction(m) for m in booked],
+                "pending": [pending_authorization(a) for a in auth_list],
+            },
+            "summary": {
+                "transactionCount": len(booked),
+                "totals": [{"currency": c, "amount": f"{v:.2f}"} for c, v in totals.items()],
+            },
+        })
+
+    label = f"{card_obj.get('brand', '')} {card_obj.get('masked_number', hash_)}"
+    period = f"{month}/{year}" if month else "current month"
+    table = Table(title=f"{escape(label)} — {period}", show_lines=False)
+    table.add_column("Date", style="cyan", no_wrap=True)
+    table.add_column("Merchant")
+    table.add_column("Detail", style="dim")
+    table.add_column("Amount", justify="right", style="bold")
+    table.add_column("Cur", style="dim")
+    for m in (cc_transaction(x) for x in booked):
+        ta = m.get("transactionAmount") or {}
+        table.add_row(
+            escape(m.get("bookingDate") or ""),
+            escape(m.get("creditorName") or ""),
+            escape(m.get("remittanceInformationUnstructured") or ""),
+            escape(ta.get("amount") or ""),
+            escape(ta.get("currency") or ""),
+        )
+    console.print(table)
+
+    for cur, total in totals.items():
+        console.print(f"  Total {escape(cur)}: [bold]{total:,.2f}[/bold]")
+    console.print(f"  [dim]{len(booked)} transactions · {len(auth_list)} pending authorizations[/dim]\n")
+
+
+# ---------------------------------------------------------------------------
+# cards-moves  (every card with its own moves, grouped)
+# ---------------------------------------------------------------------------
+
+@app.command(name="cards-moves")
+def cards_moves(
+    month: Optional[int] = typer.Option(None, "--month", "-m", help="Month 1-12"),
+    year:  Optional[int] = typer.Option(None, "--year",  "-y", help="Year e.g. 2026"),
+    json_mode: bool      = typer.Option(False, "--json",       help="Machine-readable output"),
+) -> None:
+    """Every credit card with its own transactions, grouped (one upstream fetch)."""
+    from .normalizers import cc_transaction, is_payment, card_to_ob, currency_code
+
+    client = _get_client(json_mode)
+    if not client.credit_cards:
+        if json_mode:
+            _json_error("no credit cards found", 1)
+        err.print("[red]No credit cards found.[/red]")
+        raise typer.Exit(1)
+
+    with _status.status("Fetching all cards..."):
+        try:
+            move_list = client.get_credit_card_moves(None, month, year)
+        except ItauSessionExpired:
+            if json_mode:
+                _json_error("session expired", 1)
+            err.print("[red]Session expired.[/red]")
+            raise typer.Exit(1)
+        except Exception as e:
+            if json_mode:
+                _json_error(str(e), 1)
+            err.print(f"[red]Error:[/red] {escape(str(e))}")
+            raise typer.Exit(1)
+
+    groups: dict[str, list] = {}
+    for m in move_list:
+        if is_payment(m):
+            continue
+        h = (m.get("tarjeta") or {}).get("hash") or ""
+        groups.setdefault(h, []).append(m)
+
+    if json_mode:
+        out = []
+        for c in client.credit_cards:
+            cm = groups.get(c.get("hash") or "", [])
+            tot: dict[str, float] = {}
+            for m in cm:
+                cur = currency_code(m.get("moneda") or "")
+                tot[cur] = round(tot.get(cur, 0.0) + abs(float(m.get("importe") or 0)), 2)
+            out.append({
+                "card": card_to_ob(c),
+                "transactions": {"booked": [cc_transaction(m) for m in cm]},
+                "summary": {"transactionCount": len(cm), "totals": [{"currency": k, "amount": f"{v:.2f}"} for k, v in tot.items()]},
+            })
+        _json_out({"cards": out})
+
+    period = f"{month}/{year}" if month else "current month"
+    for c in client.credit_cards:
+        cm = groups.get(c.get("hash") or "", [])
+        label = f"{c.get('brand', '')} {c.get('masked_number', '')}"
+        table = Table(title=f"{escape(label)} — {period}", show_lines=False)
+        table.add_column("Date", style="cyan", no_wrap=True)
+        table.add_column("Merchant")
+        table.add_column("Amount", justify="right", style="bold")
+        table.add_column("Cur", style="dim")
+        tot: dict[str, float] = {}
+        for m in cm:
+            t = cc_transaction(m)
+            ta = t.get("transactionAmount") or {}
+            cur = currency_code(m.get("moneda") or "")
+            tot[cur] = round(tot.get(cur, 0.0) + abs(float(m.get("importe") or 0)), 2)
+            table.add_row(
+                escape(t.get("bookingDate") or ""),
+                escape(t.get("creditorName") or ""),
+                escape(ta.get("amount") or ""),
+                escape(ta.get("currency") or ""),
+            )
+        console.print(table)
+        for cur, total in tot.items():
+            console.print(f"  Total {escape(cur)}: [bold]{total:,.2f}[/bold]")
+        console.print(f"  [dim]{len(cm)} transactions[/dim]\n")
+
+
+# ---------------------------------------------------------------------------
+# account-flow  (account transactions with signed in/out amounts)
+# ---------------------------------------------------------------------------
+
+@app.command(name="account-flow")
+def account_flow(
+    account_hash: Optional[str] = typer.Argument(None, help="Account hash (omit to pick interactively)"),
+    month:  Optional[int]       = typer.Option(None, "--month", "-m", help="Month 1-12"),
+    year:   Optional[int]       = typer.Option(None, "--year",  "-y", help="Year e.g. 2026"),
+    json_mode: bool             = typer.Option(False, "--json",       help="Machine-readable output"),
+) -> None:
+    """Bank account transactions with signed amounts: money in (+) vs out (-)."""
+    from .normalizers import account_transaction_signed, currency_code
+
+    client = _get_client(json_mode)
+
+    if not account_hash:
+        if json_mode:
+            _json_error("account_hash required in --json mode", 1)
+        account_hash = _pick_account(client)
+
+    with _status.status("Fetching account flow..."):
+        try:
+            move_list = client.get_account_moves(account_hash, month, year)
+        except ItauSessionExpired:
+            if json_mode:
+                _json_error("session expired", 1)
+            err.print("[red]Session expired.[/red]")
+            raise typer.Exit(1)
+        except Exception as e:
+            if json_mode:
+                _json_error(str(e), 1)
+            err.print(f"[red]Error:[/red] {escape(str(e))}")
+            raise typer.Exit(1)
+
+    account_obj = next((a for a in client.accounts if a.get("hash") == account_hash), None)
+    raw_currency = account_obj.get("currency") or "" if account_obj else ""
+    acct_currency = currency_code(raw_currency)
+    acct_label = escape(account_obj.get("holder") or account_hash[:12]) if account_obj else escape(account_hash[:12])
+
+    normalized = [account_transaction_signed(m, raw_currency) for m in move_list]
+
+    if json_mode:
+        _json_out({"transactions": {"booked": normalized}})
+
+    period = f"{month}/{year}" if month else "current month"
+    table = Table(title=f"{acct_label} — {period}", show_lines=False)
+    table.add_column("Date", style="cyan", no_wrap=True)
+    table.add_column("Description")
+    table.add_column("In/Out", justify="center", style="dim")
+    table.add_column("Amount", justify="right", style="bold")
+    table.add_column("Cur", style="dim")
+    table.add_column("Balance", justify="right", style="dim")
+
+    total_in = 0.0
+    total_out = 0.0
+    for m in normalized:
+        ta  = m.get("transactionAmount") or {}
+        bal = (m.get("balanceAfterTransaction") or {}).get("balanceAmount") or {}
+        cur = ta.get("currency") or acct_currency
+        amt = float(ta.get("amount") or 0)
+        if amt >= 0:
+            total_in += amt
+            direction = "[green]IN[/green]"
+            amt_str = f"[green]{ta.get('amount')}[/green]"
+        else:
+            total_out += -amt
+            direction = "[red]OUT[/red]"
+            amt_str = f"[red]{ta.get('amount')}[/red]"
+        table.add_row(
+            escape(m.get("bookingDate") or ""),
+            escape(m.get("remittanceInformationUnstructured") or ""),
+            direction,
+            amt_str,
+            escape(cur),
+            escape(bal.get("amount") or ""),
+        )
+
+    console.print(table)
+    console.print(f"  In:  [green]{total_in:,.2f}[/green]   Out: [red]{total_out:,.2f}[/red]   Net: [bold]{total_in - total_out:,.2f}[/bold] {escape(acct_currency)}")
+    console.print(f"  [dim]{len(normalized)} transactions[/dim]")
+
+
+# ---------------------------------------------------------------------------
 # request  (read-only escape hatch)
 # ---------------------------------------------------------------------------
 

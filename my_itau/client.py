@@ -7,8 +7,8 @@ Correct login + data-fetch flow (reverse-engineered, 2026):
   2. POST /trx/doLogin                → form-based auth; redirects to /trx/ on success
   3. GET  /trx/                       → dashboard HTML; parse accounts + CSRF token
   4. POST /trx/tarjetas/credito       → AJAX; returns credit-card list with hashes
-  5. POST /trx/tarjetas/credito/{hash}/movimientos_actuales/00000000   → current-month CC moves
-     POST /trx/tarjetas/credito/{hash}/movimientos_mes/{month}/{year:02d} → historic CC moves
+  5. POST /trx/tarjetas/credito/{hash}/movimientos_actuales/{YYYYMM}00 → CC moves for statement period
+     (use 00000000 as suffix for the current open period)
   6. POST /trx/cuentas/1/{hash}/mesActual                              → current-month account moves
      POST /trx/cuentas/1/{hash}/{month}/{year:02d}/consultaHistorica   → historic account moves
 
@@ -33,9 +33,6 @@ ERROR_CODES: dict[str, str] = {
     "10020": "Bad password",
     "10030": "Account blocked",
 }
-
-_CC_MOVES_SUFFIX = "00000000"
-
 
 class ItauAuthError(Exception):
     pass
@@ -87,7 +84,7 @@ class ItauClient:
 
     def get_credit_card_payload(
         self,
-        card_hash: str,
+        card_hash: Optional[str] = None,
         month: Optional[int] = None,
         year: Optional[int] = None,
     ) -> dict:
@@ -98,18 +95,12 @@ class ItauClient:
         today = date.today()
         month = month or today.month
         year = year or today.year
-        year_2d = year - 2000 if year > 2000 else year
+        url_hash = card_hash or (self.credit_cards[0]["hash"] if self.credit_cards else "")
 
-        if month == today.month and year == today.year:
-            r = self._ajax_post(
-                f"{TRX}/tarjetas/credito/{card_hash}/movimientos_actuales/{_CC_MOVES_SUFFIX}",
-                b"{}",
-            )
-        else:
-            r = self._ajax_post(
-                f"{TRX}/tarjetas/credito/{card_hash}/movimientos_mes/{month}/{year_2d:02d}",
-                b"{}",
-            )
+        r = self._ajax_post(
+            f"{TRX}/tarjetas/credito/{url_hash}/movimientos_actuales/{year:04d}{month:02d}00",
+            b"{}",
+        )
         self._check_session(r)
         r.raise_for_status()
         data = r.json()
@@ -119,19 +110,18 @@ class ItauClient:
 
     def get_credit_card_moves(
         self,
-        card_hash: str,
+        card_hash: Optional[str] = None,
         month: Optional[int] = None,
         year: Optional[int] = None,
     ) -> list[dict]:
-        """Credit-card movements. Defaults to current month."""
+        """Credit-card movements. Defaults to current statement period, all cards.
+
+        card_hash: filter to one card. If None, returns moves for all cards on the account.
+        """
         today = date.today()
         month = month or today.month
         year = year or today.year
-        year_2d = year - 2000 if year > 2000 else year
-
-        if month == today.month and year == today.year:
-            return self._fetch_cc_current(card_hash)
-        return self._fetch_cc_historic(card_hash, month, year_2d)
+        return self._fetch_cc_moves(card_hash, year, month)
 
     def get_pending_authorizations(self, card_hash: Optional[str] = None) -> list[dict]:
         """Approved pending authorizations (current period).
@@ -320,19 +310,19 @@ class ItauClient:
     # Internal: credit-card move fetchers
     # ------------------------------------------------------------------
 
-    def _fetch_cc_current(self, card_hash: str) -> list[dict]:
-        url = f"{TRX}/tarjetas/credito/{card_hash}/movimientos_actuales/{_CC_MOVES_SUFFIX}"
+    def _fetch_cc_moves(self, card_hash: Optional[str], year: int, month: int) -> list[dict]:
+        url_hash = card_hash or (self.credit_cards[0]["hash"] if self.credit_cards else "")
+        if not url_hash:
+            return []
+        url = f"{TRX}/tarjetas/credito/{url_hash}/movimientos_actuales/{year:04d}{month:02d}00"
         r = self._ajax_post(url, b"{}")
         self._check_session(r)
         r.raise_for_status()
-        return self._unwrap_cc_moves(r.json(), historic=False)
-
-    def _fetch_cc_historic(self, card_hash: str, month: int, year_2d: int) -> list[dict]:
-        url = f"{TRX}/tarjetas/credito/{card_hash}/movimientos_mes/{month}/{year_2d:02d}"
-        r = self._ajax_post(url, b"{}")
-        self._check_session(r)
-        r.raise_for_status()
-        return self._unwrap_cc_moves(r.json(), historic=True)
+        moves = self._unwrap_cc_moves(r.json(), historic=False)
+        # Endpoint returns account-wide data regardless of URL hash; filter only if caller specified one.
+        if card_hash:
+            return [m for m in moves if m.get("tarjeta", {}).get("hash") == card_hash]
+        return moves
 
     @staticmethod
     def _unwrap_cc_moves(data: Any, *, historic: bool) -> list[dict]:

@@ -42,8 +42,10 @@ from .config import credentials as cfg_credentials
 from .normalizers import (
     account_to_ob,
     account_transaction,
+    account_transaction_signed,
     card_to_ob,
     cc_transaction,
+    currency_code,
     is_payment,
     pending_authorization,
 )
@@ -149,15 +151,14 @@ mcp = FastMCP(
 
 
 def _fetch_cc_moves(card_hash: Optional[str], month: Optional[int], year: Optional[int]) -> list[dict]:
-    from .config import default_card
+    """Fetch CC moves. card_hash=None returns all cards on the account."""
     client = get_auto_client()
-    hash_ = card_hash or default_card() or (client.credit_cards[0]["hash"] if client.credit_cards else None)
-    if not hash_:
+    if not client.credit_cards:
         return []
     try:
-        return client.get_credit_card_moves(hash_, month, year)
+        return client.get_credit_card_moves(card_hash, month, year)
     except ItauSessionExpired:
-        return refresh_auto_client().get_credit_card_moves(hash_, month, year)
+        return refresh_auto_client().get_credit_card_moves(card_hash, month, year)
 
 
 @mcp.tool()
@@ -179,7 +180,7 @@ def get_moves(
     Args:
         month:     Month 1-12. Defaults to current month.
         year:      Full year e.g. 2026. Defaults to current year.
-        card_hash: resourceId from get_cards(). Defaults to stored default card.
+        card_hash: resourceId from get_cards(). Omit for all cards on the account.
     """
     moves = _fetch_cc_moves(card_hash, month, year)
     return [cc_transaction(m) for m in moves if not is_payment(m)]
@@ -198,7 +199,7 @@ def get_summary(
     Args:
         month:     Month 1-12. Defaults to current month.
         year:      Full year e.g. 2026. Defaults to current year.
-        card_hash: resourceId from get_cards(). Defaults to stored default card.
+        card_hash: resourceId from get_cards(). Omit for all cards on the account.
     """
     moves = _fetch_cc_moves(card_hash, month, year)
     totals: dict[str, float] = {}
@@ -269,6 +270,147 @@ def get_account_moves(
 
 
 # ---------------------------------------------------------------------------
+# Builders shared by the new per-card / account-flow surfaces
+# ---------------------------------------------------------------------------
+
+
+def _spend_totals(moves: list[dict]) -> list[dict]:
+    """Per-currency spend totals (absolute debits) for a list of raw CC moves."""
+    totals: dict[str, float] = {}
+    for m in moves:
+        if is_payment(m):
+            continue
+        cur = currency_code(m.get("moneda") or "")
+        totals[cur] = round(totals.get(cur, 0.0) + abs(float(m.get("importe") or 0)), 2)
+    return [{"currency": cur, "amount": f"{amt:.2f}"} for cur, amt in totals.items()]
+
+
+def _build_cards_grouped(
+    client: ItauClient, month: Optional[int], year: Optional[int]
+) -> list[dict]:
+    """Every card with its own booked moves nested under it.
+
+    One upstream fetch (the CC endpoint is account-wide), grouped client-side by
+    ``tarjeta.hash`` — avoids hammering Itaú with one request per card.
+    """
+    moves = client.get_credit_card_moves(None, month, year)
+    groups: dict[str, list[dict]] = {}
+    for m in moves:
+        if is_payment(m):
+            continue
+        h = (m.get("tarjeta") or {}).get("hash") or ""
+        groups.setdefault(h, []).append(m)
+
+    result = []
+    for c in client.credit_cards:
+        h = c.get("hash") or ""
+        card_moves = groups.get(h, [])
+        result.append({
+            "card": card_to_ob(c),
+            "transactions": {"booked": [cc_transaction(m) for m in card_moves]},
+            "summary": {"transactionCount": len(card_moves), "totals": _spend_totals(card_moves)},
+        })
+    return result
+
+
+def _build_card_bundle(
+    client: ItauClient, card_hash: str, month: Optional[int], year: Optional[int]
+) -> Optional[dict]:
+    """One card's metadata + booked moves + pending auths + spend summary."""
+    card = next((c for c in client.credit_cards if c.get("hash") == card_hash), None)
+    if card is None:
+        return None
+    moves = client.get_credit_card_moves(card_hash, month, year)
+    booked = [m for m in moves if not is_payment(m)]
+    auths = client.get_pending_authorizations(card_hash)
+    return {
+        "card": card_to_ob(card),
+        "transactions": {
+            "booked": [cc_transaction(m) for m in booked],
+            "pending": [pending_authorization(a) for a in auths],
+        },
+        "summary": {"transactionCount": len(booked), "totals": _spend_totals(booked)},
+    }
+
+
+# ---------------------------------------------------------------------------
+# New MCP tools: independent per-card views + account money-flow (in/out)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_cards_moves(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+) -> list[dict]:
+    """
+    Every credit card with its own transactions nested under it (one call).
+    Each entry: {card, transactions.booked, summary}. Amounts negative (debit).
+
+    Args:
+        month: Month 1-12. Defaults to current month.
+        year:  Full year e.g. 2026. Defaults to current year.
+    """
+    client = get_auto_client()
+    try:
+        return _build_cards_grouped(client, month, year)
+    except ItauSessionExpired:
+        return _build_cards_grouped(refresh_auto_client(), month, year)
+
+
+@mcp.tool()
+def get_card(
+    card_hash: str,
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+) -> dict:
+    """
+    A single card's full bundle: metadata, booked transactions, pending
+    authorizations, and a per-currency spend summary.
+
+    Args:
+        card_hash: resourceId from get_cards().
+        month:     Month 1-12. Defaults to current month.
+        year:      Full year e.g. 2026. Defaults to current year.
+    """
+    client = get_auto_client()
+    try:
+        bundle = _build_card_bundle(client, card_hash, month, year)
+    except ItauSessionExpired:
+        bundle = _build_card_bundle(refresh_auto_client(), card_hash, month, year)
+    if bundle is None:
+        raise ValueError(f"No card with hash {card_hash}")
+    return bundle
+
+
+@mcp.tool()
+def get_account_flow(
+    account_hash: str,
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+) -> list[dict]:
+    """
+    Bank account transactions with signed amounts (money in vs out).
+    Debits (out) are negative with creditDebitIndicator 'DBIT'; credits (in)
+    are positive with 'CRDT'. Berlin Group shape.
+
+    Args:
+        account_hash: resourceId from get_accounts().
+        month:        Month 1-12. Defaults to current month.
+        year:         Full year e.g. 2026. Defaults to current year.
+    """
+    client = get_auto_client()
+    cur = _account_currency(client, account_hash)
+    try:
+        moves = client.get_account_moves(account_hash, month, year)
+    except ItauSessionExpired:
+        client = refresh_auto_client()
+        cur = _account_currency(client, account_hash)
+        moves = client.get_account_moves(account_hash, month, year)
+    return [account_transaction_signed(m, cur) for m in moves]
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -334,21 +476,19 @@ def api_status():
 
 
 @app.get("/moves", dependencies=[Depends(require_api_key)])
-def rest_get_moves(month: Optional[int] = None, year: Optional[int] = None):
-    """CC transactions for default card (OB format)."""
-    from .config import default_card
+def rest_get_moves(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    card_hash: Optional[str] = None,
+):
+    """CC transactions (OB format). Defaults to all cards; pass card_hash to filter to one."""
     client = get_auto_client()
-    default = default_card()
-    card = (
-        next((c for c in client.credit_cards if c["hash"] == default), None)
-        if default else (client.credit_cards[0] if client.credit_cards else None)
-    )
-    if not card:
-        raise HTTPException(status_code=404, detail="No credit cards found. Run: my-itau set-card")
+    if not client.credit_cards:
+        raise HTTPException(status_code=404, detail="No credit cards found.")
     try:
-        moves = client.get_credit_card_moves(card["hash"], month, year)
+        moves = client.get_credit_card_moves(card_hash, month, year)
     except ItauSessionExpired:
-        moves = refresh_auto_client().get_credit_card_moves(card["hash"], month, year)
+        moves = refresh_auto_client().get_credit_card_moves(card_hash, month, year)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
     return {"transactions": {"booked": [cc_transaction(m) for m in moves if not is_payment(m)]}}
@@ -369,6 +509,53 @@ def rest_get_moves_for_card(card_hash: str, month: Optional[int] = None, year: O
 @app.get("/cards", dependencies=[Depends(require_api_key)])
 def rest_get_cards():
     return {"paymentAccounts": [card_to_ob(c) for c in get_auto_client().credit_cards]}
+
+
+# NOTE: declared before /cards/{card_hash} so the static path wins the match.
+@app.get("/cards/moves", dependencies=[Depends(require_api_key)])
+def rest_get_cards_moves(month: Optional[int] = None, year: Optional[int] = None):
+    """Every card with its own moves nested under it (one upstream fetch, grouped)."""
+    client = get_auto_client()
+    if not client.credit_cards:
+        raise HTTPException(status_code=404, detail="No credit cards found.")
+    try:
+        cards = _build_cards_grouped(client, month, year)
+    except ItauSessionExpired:
+        cards = _build_cards_grouped(refresh_auto_client(), month, year)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"cards": cards}
+
+
+@app.get("/cards/{card_hash}", dependencies=[Depends(require_api_key)])
+def rest_get_card_bundle(card_hash: str, month: Optional[int] = None, year: Optional[int] = None):
+    """One card's metadata + booked moves + pending auths + spend summary."""
+    client = get_auto_client()
+    try:
+        bundle = _build_card_bundle(client, card_hash, month, year)
+    except ItauSessionExpired:
+        bundle = _build_card_bundle(refresh_auto_client(), card_hash, month, year)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if bundle is None:
+        raise HTTPException(status_code=404, detail=f"No card with hash {card_hash}")
+    return bundle
+
+
+@app.get("/accounts/{account_hash}/moves", dependencies=[Depends(require_api_key)])
+def rest_get_account_flow(account_hash: str, month: Optional[int] = None, year: Optional[int] = None):
+    """Account transactions with signed amounts (in/out). Debit negative, credit positive."""
+    client = get_auto_client()
+    cur = _account_currency(client, account_hash)
+    try:
+        moves = client.get_account_moves(account_hash, month, year)
+    except ItauSessionExpired:
+        client = refresh_auto_client()
+        cur = _account_currency(client, account_hash)
+        moves = client.get_account_moves(account_hash, month, year)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"transactions": {"booked": [account_transaction_signed(m, cur) for m in moves]}}
 
 
 @app.get("/authorizations", dependencies=[Depends(require_api_key)])
