@@ -38,7 +38,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastmcp import FastMCP
 from pydantic import BaseModel
 
-from .client import ItauAuthError, ItauClient, ItauSessionExpired
+from .client import ItauAuthError, ItauClient, ItauNoHistoric, ItauSessionExpired
 from .config import any_api_keys_configured, validate_api_key
 from .config import credentials as cfg_credentials
 from .normalizers import (
@@ -159,12 +159,9 @@ def _fetch_cc_moves(card_hash: Optional[str], month: Optional[int], year: Option
     try:
         return client.get_credit_card_moves(card_hash, month, year)
     except ItauSessionExpired:
-        # Retry once on a fresh session; a persistent redirect afterwards means
-        # this card has no movements for the period rather than a session issue.
-        try:
-            return refresh_auto_client().get_credit_card_moves(card_hash, month, year)
-        except ItauSessionExpired:
-            return []
+        # Transient expiry — re-login once and retry. A persistent expiry
+        # propagates (surfaces as 401) rather than masquerading as "no moves".
+        return refresh_auto_client().get_credit_card_moves(card_hash, month, year)
 
 
 @mcp.tool()
@@ -487,6 +484,14 @@ async def _handle_session_expired(request: Request, exc: ItauSessionExpired):
     return JSONResponse(status_code=401, content={"error": {"code": "session_expired", "message": str(exc)}})
 
 
+@app.exception_handler(ItauNoHistoric)
+async def _handle_no_historic(request: Request, exc: ItauNoHistoric):
+    # Defensive net: the historic fetcher already converts this to an empty
+    # result at the client, so this only fires if a future path lets it escape.
+    # It's "no data here", never a hard failure — surface an empty booked list.
+    return JSONResponse(status_code=200, content={"transactions": {"booked": []}})
+
+
 # Mount MCP — SSE transport at /mcp/sse, streamable-HTTP at /mcp/
 app.mount("/mcp", mcp.http_app())
 
@@ -606,21 +611,13 @@ def rest_get_account_flow(account_hash: str, month: Optional[int] = None, year: 
     try:
         moves = client.get_account_moves(account_hash, month, year)
     except ItauSessionExpired:
-        # Retry once with a fresh session. If the historic endpoint STILL
-        # redirects (302) after a valid login — as some accounts do, e.g.
-        # business "empresa" accounts that don't expose consultaHistorica —
-        # it's not a real session problem: treat it as "no historic here"
-        # and return empty instead of 500ing the whole backfill.
-        try:
-            client = refresh_auto_client()
-            cur = _account_currency(client, account_hash)
-            moves = client.get_account_moves(account_hash, month, year)
-        except ItauSessionExpired:
-            logger.info(
-                "Account %s has no historic movements for %s/%s (persistent redirect) — returning empty",
-                account_hash, month, year,
-            )
-            moves = []
+        # Transient expiry — re-login once and retry. Accounts that genuinely
+        # expose no historic view already return [] at the client (ItauNoHistoric),
+        # so a *persistent* expiry here is a real session problem and now surfaces
+        # as 401 instead of being masked as "no movements".
+        client = refresh_auto_client()
+        cur = _account_currency(client, account_hash)
+        moves = client.get_account_moves(account_hash, month, year)
     except HTTPException:
         raise
     except Exception as e:

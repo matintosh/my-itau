@@ -45,6 +45,16 @@ class ItauAuthError(Exception):
 
 
 class ItauSessionExpired(Exception):
+    """The Itaú session is genuinely gone — the redirect carried the
+    `expiredSession` marker. Callers should re-login and retry."""
+    pass
+
+
+class ItauNoHistoric(Exception):
+    """The historic endpoint redirected WITHOUT an `expiredSession` marker.
+    That is not a session problem: the account simply doesn't expose a
+    historic-movements view (e.g. business "empresa" accounts). Callers should
+    treat it as "no movements for this period", NOT as an error."""
     pass
 
 
@@ -386,7 +396,13 @@ class ItauClient:
     def _fetch_account_historic(self, account_hash: str, month: int, year_2d: int) -> list[dict]:
         url = f"{TRX}/cuentas/1/{account_hash}/{month}/{year_2d:02d}/consultaHistorica"
         r = self._ajax_post(url, b"{}")
-        self._check_session(r)
+        try:
+            self._check_session(r, allow_no_historic=True)
+        except ItauNoHistoric:
+            # Account genuinely exposes no historic view — not an error, and a
+            # re-login wouldn't help. Report it as an empty period. A real
+            # session expiry (marker present) still raises ItauSessionExpired.
+            return []
         r.raise_for_status()
         data = r.json()
         try:
@@ -416,7 +432,21 @@ class ItauClient:
         )
 
     @staticmethod
-    def _check_session(response: httpx.Response) -> None:
+    def _check_session(response: httpx.Response, *, allow_no_historic: bool = False) -> None:
+        """Raise if the data endpoint redirected instead of returning JSON.
+
+        A redirect carrying the `expiredSession` marker is always a real session
+        loss (ItauSessionExpired). On the historic endpoint, a *bare* redirect
+        (no marker) instead means the account has no historic view — that is not
+        a session problem, so raise ItauNoHistoric and let the caller treat it as
+        "no movements". Everywhere else, any redirect is treated as expiry.
+        """
         loc = response.headers.get("location", "")
-        if response.status_code in (301, 302, 303) or "expiredSession" in loc:
-            raise ItauSessionExpired("Itaú session expired — please login again")
+        is_redirect = response.status_code in (301, 302, 303)
+        expired = "expiredSession" in loc
+        if not is_redirect and not expired:
+            return
+        if allow_no_historic and is_redirect and not expired:
+            logger.info("Historic endpoint redirected without expiredSession marker (loc=%r) — treating as no historic view", loc[:120])
+            raise ItauNoHistoric("Account has no historic-movements view")
+        raise ItauSessionExpired("Itaú session expired — please login again")
