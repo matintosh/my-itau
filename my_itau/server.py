@@ -31,8 +31,10 @@ import threading
 from datetime import datetime
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastmcp import FastMCP
 from pydantic import BaseModel
 
@@ -68,15 +70,14 @@ _auto_lock = threading.Lock()
 def _auto_login() -> ItauClient:
     doc, pwd = cfg_credentials()
     if not doc or not pwd:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No credentials. Run: my-itau config",
-        )
+        raise api_error("not_configured", "No credentials. Run: my-itau config", status.HTTP_503_SERVICE_UNAVAILABLE)
     client = ItauClient()
     try:
         client.login(doc, pwd)
     except ItauAuthError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+        if getattr(e, "code", None) == "10030":
+            raise api_error("account_blocked", str(e), status.HTTP_429_TOO_MANY_REQUESTS)
+        raise api_error("auth_failed", str(e), status.HTTP_401_UNAUTHORIZED)
     return client
 
 
@@ -118,7 +119,7 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     if not any_api_keys_configured():
         return  # server is open — no keys defined
     if not x_api_key or validate_api_key(x_api_key) is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired API key")
+        raise api_error("invalid_api_key", "Invalid or expired API key", status.HTTP_401_UNAUTHORIZED)
 
 
 def get_manual_session(
@@ -158,7 +159,12 @@ def _fetch_cc_moves(card_hash: Optional[str], month: Optional[int], year: Option
     try:
         return client.get_credit_card_moves(card_hash, month, year)
     except ItauSessionExpired:
-        return refresh_auto_client().get_credit_card_moves(card_hash, month, year)
+        # Retry once on a fresh session; a persistent redirect afterwards means
+        # this card has no movements for the period rather than a session issue.
+        try:
+            return refresh_auto_client().get_credit_card_moves(card_hash, month, year)
+        except ItauSessionExpired:
+            return []
 
 
 @mcp.tool()
@@ -439,6 +445,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Structured errors — every failure is JSON: {"error": {"code", "message"}}
+# so callers can branch (retry / back off / reconnect) on the machine `code`
+# instead of parsing a human string.
+#
+#   invalid_api_key  (401)  bad/missing x-api-key
+#   not_configured   (503)  server has no Itaú credentials
+#   auth_failed      (401)  bad document/password
+#   account_blocked  (429)  Itaú blocked the account (too many attempts) — back off
+#   session_expired  (401)  session died and couldn't recover
+#   not_found        (404)
+#   upstream_error   (502)  Itaú returned something unexpected — usually retryable
+# ---------------------------------------------------------------------------
+
+
+def api_error(code: str, message: str, http_status: int) -> HTTPException:
+    return HTTPException(status_code=http_status, detail={"code": code, "message": message})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _structured_http_error(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict) and "code" in detail:
+        body = {"error": detail}
+    else:
+        body = {"error": {"code": "error", "message": detail}}
+    return JSONResponse(status_code=exc.status_code, content=body, headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(ItauAuthError)
+async def _handle_auth_error(request: Request, exc: ItauAuthError):
+    if getattr(exc, "code", None) == "10030":
+        return JSONResponse(status_code=429, content={"error": {"code": "account_blocked", "message": str(exc)}})
+    return JSONResponse(status_code=401, content={"error": {"code": "auth_failed", "message": str(exc)}})
+
+
+@app.exception_handler(ItauSessionExpired)
+async def _handle_session_expired(request: Request, exc: ItauSessionExpired):
+    return JSONResponse(status_code=401, content={"error": {"code": "session_expired", "message": str(exc)}})
+
+
 # Mount MCP — SSE transport at /mcp/sse, streamable-HTTP at /mcp/
 app.mount("/mcp", mcp.http_app())
 
@@ -484,13 +532,15 @@ def rest_get_moves(
     """CC transactions (OB format). Defaults to all cards; pass card_hash to filter to one."""
     client = get_auto_client()
     if not client.credit_cards:
-        raise HTTPException(status_code=404, detail="No credit cards found.")
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "No credit cards found."})
     try:
         moves = client.get_credit_card_moves(card_hash, month, year)
     except ItauSessionExpired:
         moves = refresh_auto_client().get_credit_card_moves(card_hash, month, year)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"booked": [cc_transaction(m) for m in moves if not is_payment(m)]}}
 
 
@@ -501,8 +551,10 @@ def rest_get_moves_for_card(card_hash: str, month: Optional[int] = None, year: O
         moves = client.get_credit_card_moves(card_hash, month, year)
     except ItauSessionExpired:
         moves = refresh_auto_client().get_credit_card_moves(card_hash, month, year)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"booked": [cc_transaction(m) for m in moves if not is_payment(m)]}}
 
 
@@ -517,13 +569,15 @@ def rest_get_cards_moves(month: Optional[int] = None, year: Optional[int] = None
     """Every card with its own moves nested under it (one upstream fetch, grouped)."""
     client = get_auto_client()
     if not client.credit_cards:
-        raise HTTPException(status_code=404, detail="No credit cards found.")
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "No credit cards found."})
     try:
         cards = _build_cards_grouped(client, month, year)
     except ItauSessionExpired:
         cards = _build_cards_grouped(refresh_auto_client(), month, year)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"cards": cards}
 
 
@@ -535,10 +589,12 @@ def rest_get_card_bundle(card_hash: str, month: Optional[int] = None, year: Opti
         bundle = _build_card_bundle(client, card_hash, month, year)
     except ItauSessionExpired:
         bundle = _build_card_bundle(refresh_auto_client(), card_hash, month, year)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     if bundle is None:
-        raise HTTPException(status_code=404, detail=f"No card with hash {card_hash}")
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": f"No card with hash {card_hash}"})
     return bundle
 
 
@@ -550,11 +606,25 @@ def rest_get_account_flow(account_hash: str, month: Optional[int] = None, year: 
     try:
         moves = client.get_account_moves(account_hash, month, year)
     except ItauSessionExpired:
-        client = refresh_auto_client()
-        cur = _account_currency(client, account_hash)
-        moves = client.get_account_moves(account_hash, month, year)
+        # Retry once with a fresh session. If the historic endpoint STILL
+        # redirects (302) after a valid login — as some accounts do, e.g.
+        # business "empresa" accounts that don't expose consultaHistorica —
+        # it's not a real session problem: treat it as "no historic here"
+        # and return empty instead of 500ing the whole backfill.
+        try:
+            client = refresh_auto_client()
+            cur = _account_currency(client, account_hash)
+            moves = client.get_account_moves(account_hash, month, year)
+        except ItauSessionExpired:
+            logger.info(
+                "Account %s has no historic movements for %s/%s (persistent redirect) — returning empty",
+                account_hash, month, year,
+            )
+            moves = []
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"booked": [account_transaction_signed(m, cur) for m in moves]}}
 
 
@@ -566,8 +636,10 @@ def rest_get_authorizations():
         auths = client.get_pending_authorizations()
     except ItauSessionExpired:
         auths = refresh_auto_client().get_pending_authorizations()
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"pending": [pending_authorization(a) for a in auths]}}
 
 
@@ -579,8 +651,10 @@ def rest_get_authorizations_for_card(card_hash: str):
         auths = client.get_pending_authorizations(card_hash)
     except ItauSessionExpired:
         auths = refresh_auto_client().get_pending_authorizations(card_hash)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"pending": [pending_authorization(a) for a in auths]}}
 
 
@@ -626,8 +700,10 @@ def credit_card_moves(
         moves = client.get_credit_card_moves(card_hash, month, year)
     except ItauSessionExpired:
         raise HTTPException(status_code=401, detail="Session expired. POST /login again.")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"booked": [cc_transaction(m) for m in moves if not is_payment(m)]}}
 
 
@@ -643,8 +719,10 @@ def account_moves(
         moves = client.get_account_moves(account_hash, month, year)
     except ItauSessionExpired:
         raise HTTPException(status_code=401, detail="Session expired. POST /login again.")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"booked": [account_transaction(m, cur) for m in moves]}}
 
 
@@ -685,8 +763,10 @@ def v1_account_transactions(
         client = refresh_auto_client()
         cur = _account_currency(client, account_id)
         moves = client.get_account_moves(account_id, month, year)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"booked": [account_transaction(m, cur) for m in moves]}}
 
 
@@ -708,8 +788,10 @@ def v1_card_transactions(
         moves = client.get_credit_card_moves(card_id, month, year)
     except ItauSessionExpired:
         moves = refresh_auto_client().get_credit_card_moves(card_id, month, year)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {
         "transactions": {
             "booked": [cc_transaction(m) for m in moves if not is_payment(m)]
@@ -725,8 +807,10 @@ def v1_card_authorizations(card_id: str):
         auths = client.get_pending_authorizations(card_id)
     except ItauSessionExpired:
         auths = refresh_auto_client().get_pending_authorizations(card_id)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail={"code": "upstream_error", "message": str(e)})
     return {"transactions": {"pending": [pending_authorization(a) for a in auths]}}
 
 

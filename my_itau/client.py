@@ -35,7 +35,13 @@ ERROR_CODES: dict[str, str] = {
 }
 
 class ItauAuthError(Exception):
-    pass
+    """Login/authentication failure. `code` is Itaú's numeric message_code
+    (see ERROR_CODES) when available, so callers can distinguish e.g. a
+    blocked account (10030) from bad credentials."""
+
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
 
 
 class ItauSessionExpired(Exception):
@@ -77,7 +83,7 @@ class ItauClient:
         if "message_code=" in redirect:
             m = re.search(r"message_code=(\d+)", redirect)
             code = m.group(1) if m else "unknown"
-            raise ItauAuthError(ERROR_CODES.get(code, f"Login failed (code {code})"))
+            raise ItauAuthError(ERROR_CODES.get(code, f"Login failed (code {code})"), code=code)
 
         self._load_dashboard()
         self._load_credit_cards()
