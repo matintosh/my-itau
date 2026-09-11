@@ -78,6 +78,8 @@ class ItauClient:
         self._csrf: str = ""
         self.accounts: list[dict] = []
         self.credit_cards: list[dict] = []
+        # Card product + art (from /actualizar) never change → cache per session.
+        self._card_art_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -283,6 +285,42 @@ class ItauClient:
 
         self.credit_cards = cards
         logger.info("Loaded %d credit cards", len(self.credit_cards))
+
+    def card_art(self, card_hash: str) -> dict:
+        """Product name + card-art image URL for a card, from the per-card
+        `/actualizar` view. Cached per session (these never change). Returns
+        {"product": str|None, "imageUrl": str|None} — empty on any failure."""
+        if card_hash in self._card_art_cache:
+            return self._card_art_cache[card_hash]
+        result: dict = {"product": None, "imageUrl": None}
+        try:
+            r = self._http.get(
+                f"{TRX}/tarjetas/credito/{card_hash}/actualizar",
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-CSRF-TOKEN": self._csrf,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"{BASE_URL}{TRX}/",
+                },
+            )
+            if r.status_code == 200:
+                datos = (
+                    r.json().get("itaulink_msg", {}).get("data", {}).get("datos", {})
+                )
+                imagen = datos.get("imagen")
+                product = (datos.get("datosAdicionales") or {}).get("tipo")
+                if not product:  # fall back to the card's own descripcion
+                    for t in (datos.get("allTarjetas") or []):
+                        if t.get("hash") == card_hash and t.get("descripcion"):
+                            product = t["descripcion"]
+                            break
+                result["product"] = product or None
+                if imagen:
+                    result["imageUrl"] = f"{BASE_URL}/static/img/dynamic/tarjetas_credito/{imagen}"
+        except Exception as e:  # best-effort — never break the cards list
+            logger.warning("card_art(%s) failed: %s", card_hash[:8], e)
+        self._card_art_cache[card_hash] = result
+        return result
 
     # ------------------------------------------------------------------
     # Internal: normalise raw objects

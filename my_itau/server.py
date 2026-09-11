@@ -565,7 +565,13 @@ def rest_get_moves_for_card(card_hash: str, month: Optional[int] = None, year: O
 
 @app.get("/cards", dependencies=[Depends(require_api_key)])
 def rest_get_cards():
-    return {"paymentAccounts": [card_to_ob(c) for c in get_auto_client().credit_cards]}
+    client = get_auto_client()
+    # Enrich each card with its product name + card-art image (from /actualizar,
+    # cached per session). Best-effort: never fails the list.
+    return {"paymentAccounts": [
+        {**card_to_ob(c), **client.card_art(c.get("hash") or "")}
+        for c in client.credit_cards
+    ]}
 
 
 # NOTE: declared before /cards/{card_hash} so the static path wins the match.
