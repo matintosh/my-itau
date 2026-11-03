@@ -6,6 +6,13 @@ Correct login + data-fetch flow (reverse-engineered, 2026):
   1. GET  /trx/                       → prime session cookies
   2. POST /trx/doLogin                → form-based auth; redirects to /trx/ on success
   3. GET  /trx/                       → dashboard HTML; parse accounts + CSRF token
+     ...or a 302 to /trx/inicio-seguro when the device isn't recognized. That
+     page embeds `opeID` + the account's token types; then:
+       POST /trx/tokens/operations/sms          {operationId, tokenType=SMS_TOKEN}  (SMS only)
+       POST /trx/inicio-seguro/validar-token    {token, tipoToken, operationID}
+     → data.operacion_aprobada on success, after which step 3 succeeds.
+     Itaú sets no persistent "trusted device" cookie, so this repeats on every
+     fresh login from an unrecognized device.
   4. POST /trx/tarjetas/credito       → AJAX; returns credit-card list with hashes
   5. POST /trx/tarjetas/credito/{hash}/movimientos_actuales/{YYYYMM}00 → CC moves for statement period
      (use 00000000 as suffix for the current open period)
@@ -19,7 +26,6 @@ import json
 import logging
 import re
 from datetime import date
-from html.parser import HTMLParser
 from typing import Any, Optional
 
 import httpx
@@ -60,109 +66,37 @@ class ItauNoHistoric(Exception):
 
 
 class ItauTwoFactorRequired(Exception):
-    """Login succeeded (credentials were correct) but Itaú doesn't recognize
-    this device/session and is demanding a second factor (iToken) before
-    granting dashboard access — redirects to /trx/inicio-seguro.
+    """Login credentials were correct, but Itaú doesn't recognize this device
+    and demands a second factor before granting dashboard access (it redirects
+    to /trx/inicio-seguro).
 
-    `challenge` is a structural description of the 2FA page (form actions,
-    field names, select options, /trx/ endpoints referenced in scripts) with
-    all field *values* redacted — safe to log, used to reverse-engineer the
-    step-2 submission."""
+    The client that raised this is left mid-login: call
+    `submit_second_factor(code, token_type)` on it (or on a client rebuilt via
+    `ItauClient.from_session(client.export_session())`) to finish.
 
-    def __init__(self, message: str, challenge: Optional[dict] = None):
+    `token_types`: what the account supports, e.g. ["SMS_TOKEN", "ITOKEN"].
+    `phone_masked`: where an SMS code would go, e.g. "****1234" (or None)."""
+
+    def __init__(self, message: str, token_types: list[str], phone_masked: Optional[str]):
         super().__init__(message)
-        self.challenge = challenge or {}
+        self.token_types = token_types
+        self.phone_masked = phone_masked
 
 
-class _ChallengeParser(HTMLParser):
-    """Collects form structure only — never field values (except <option>s,
-    which are the method choices like ITOKEN/SMS, not user data)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.forms: list[dict] = []
-        self.scripts: list[str] = []
-        self.inline_js: list[str] = []
-        self.csrf_header_name: Optional[str] = None
-        self._in_inline_script = False
-        self._select: Optional[dict] = None
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        if tag == "form":
-            self.forms.append({"action": a.get("action"), "method": a.get("method"), "id": a.get("id"), "fields": []})
-        elif tag in ("input", "button", "textarea") and self.forms:
-            self.forms[-1]["fields"].append({
-                "tag": tag, "type": a.get("type"), "name": a.get("name"), "id": a.get("id"),
-                "has_value": bool(a.get("value")),
-            })
-        elif tag == "select":
-            self._select = {"tag": "select", "name": a.get("name"), "id": a.get("id"), "options": []}
-            (self.forms[-1]["fields"] if self.forms else []).append(self._select)
-        elif tag == "option" and self._select is not None:
-            self._select["options"].append(a.get("value"))
-        elif tag == "script":
-            if a.get("src"):
-                self.scripts.append(a["src"])
-            else:
-                self._in_inline_script = True
-        elif tag == "meta" and a.get("name") == "_csrf_header":
-            self.csrf_header_name = a.get("content")  # a header *name*, not a secret
-
-    def handle_data(self, data):
-        if getattr(self, "_in_inline_script", False):
-            self.inline_js.append(data)
-
-    def handle_endtag(self, tag):
-        if tag == "select":
-            self._select = None
-        elif tag == "script":
-            self._in_inline_script = False
+TOKEN_TYPES = ("ITOKEN", "SMS_TOKEN", "PHYSICAL_TOKEN")
 
 
-_INTERESTING_JS = ("validar-token", "loadTokensOptions", "tokens/operations", "generar-token", "select-token", "load-token")
-
-
-def _redact_js(snippet: str) -> str:
-    # Keep code structure (field names, URLs, call shapes); drop anything that
-    # could be user/session data: quoted strings with digits, then any digit run.
-    snippet = re.sub(r"""(['"])(?=[^'"]*\d[^'"]*\d)[^'"]{2,}\1""", r"\1<redacted>\1", snippet)
-    return re.sub(r"\d{3,}", "<n>", snippet)
-
-
-def _inline_js_snippets(chunks: list[str]) -> list[str]:
-    js = "\n".join(chunks)
-    out = []
-    for kw in _INTERESTING_JS:
-        for m in re.finditer(re.escape(kw), js):
-            snip = _redact_js(js[max(0, m.start() - 700): m.end() + 700])
-            if snip not in out:
-                out.append(snip)
-            if len(out) >= 10:
-                return out
-    return out
-
-
-def _describe_challenge(html: str) -> dict:
-    p = _ChallengeParser()
-    try:
-        p.feed(html)
-    except Exception:  # noqa: BLE001 — recon only, never block on parse errors
-        pass
-    html_snips = []
-    for kw in ("section-token", "generar-token", "select-token", "validar-token", "data-flujo", "loadTokensOptions"):
-        i = html.find(kw)
-        if i != -1:
-            html_snips.append(_redact_js(html[max(0, i - 400): i + 900]))
+def _parse_second_factor_page(html: str) -> dict:
+    """Pull what the inicio-seguro page's own JS uses to drive the token step."""
+    ope = re.search(r"var opeID\s*=\s*'([^']+)'", html)
+    types = re.search(r"var twofactorsAuth\s*=\s*'\[([^\]]*)\]'", html)
+    phone = re.search(r'id="phone-number-token-to-send"[^>]*>([^<]+)<', html)
+    csrf = re.search(r'<meta name="_csrf"\s+content="([^"]+)"', html)
     return {
-        "forms": p.forms,
-        "script_srcs": p.scripts,
-        "csrf_header_name": p.csrf_header_name,
-        "trx_paths": sorted(set(re.findall(r"""/trx/[A-Za-z0-9_\-/.]+""", html))),
-        "mentions": sorted({w for w in ("sms", "itoken", "token", "otp", "codigo", "celular")
-                            if w in html.lower()}),
-        "inline_js": _inline_js_snippets(p.inline_js),
-        "html_snippets": html_snips,
+        "operation_id": ope.group(1) if ope else None,
+        "token_types": [t.strip() for t in types.group(1).split(",") if t.strip()] if types else [],
+        "phone_masked": phone.group(1).strip() if phone else None,
+        "csrf": csrf.group(1) if csrf else "",
     }
 
 
@@ -188,13 +122,17 @@ class ItauClient:
         self.credit_cards: list[dict] = []
         # Card product + art (from /actualizar) never change → cache per session.
         self._card_art_cache: dict[str, dict] = {}
+        # Set while a login is parked on Itaú's second-factor step.
+        self._pending_2fa: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def login(self, document_number: str, password: str) -> None:
-        """Authenticate. Raises ItauAuthError on bad credentials."""
+        """Authenticate. Raises ItauAuthError on bad credentials, or
+        ItauTwoFactorRequired when Itaú doesn't recognize the device — finish
+        that with submit_second_factor() (after request_sms() for SMS codes)."""
         logger.info("Logging in as ••%s", document_number[-3:])
         self._prime_session()
         redirect = self._do_login(document_number, password)
@@ -207,6 +145,69 @@ class ItauClient:
 
         self._load_dashboard()
         self._load_credit_cards()
+
+    # -- Second factor (inicio-seguro) ------------------------------------
+
+    def request_sms(self) -> None:
+        """Ask Itaú to text a one-time code to the account's phone."""
+        p = self._require_pending()
+        if "SMS_TOKEN" not in p["token_types"]:
+            raise ItauAuthError("This account doesn't support SMS codes.")
+        r = self._ajax_post(
+            f"{TRX}/tokens/operations/sms",
+            str(httpx.QueryParams({"operationId": p["operation_id"], "tokenType": "SMS_TOKEN"})).encode(),
+        )
+        r.raise_for_status()
+        err = (r.json().get("itaulink_msg", {}).get("data", {}) or {}).get("errorMsg")
+        if err:
+            raise ItauAuthError(f"Itaú couldn't send the SMS: {err}")
+
+    def submit_second_factor(self, code: str, token_type: str = "ITOKEN") -> None:
+        """Finish a login parked on the second-factor step. On success the
+        client is fully logged in (accounts + cards loaded), same as login()."""
+        p = self._require_pending()
+        if token_type not in TOKEN_TYPES:
+            raise ValueError(f"token_type must be one of {TOKEN_TYPES}")
+        r = self._ajax_post(
+            f"{TRX}/inicio-seguro/validar-token",
+            str(httpx.QueryParams({"token": code.strip(), "tipoToken": token_type, "operationID": p["operation_id"]})).encode(),
+        )
+        if r.is_redirect:
+            raise ItauSessionExpired("The second-factor step expired — start the login again.")
+        r.raise_for_status()
+        data = (r.json().get("itaulink_msg", {}) or {}).get("data", {}) or {}
+        if "operacion_aprobada" not in data:
+            msg = data.get("errorAlert") or data.get("error") or "Itaú rejected the code."
+            raise ItauAuthError(re.sub(r"<[^>]+>", "", str(msg)).strip(), code="second_factor_rejected")
+        self._pending_2fa = None
+        self._load_dashboard()
+        self._load_credit_cards()
+
+    def export_session(self) -> dict:
+        """Serializable snapshot of the live session (cookies, CSRF, any parked
+        second-factor step). Treat as a credential — it IS one, for ~20 min."""
+        return {
+            "cookies": [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+                        for c in self._http.cookies.jar],
+            "csrf": self._csrf,
+            "pending_2fa": self._pending_2fa,
+        }
+
+    @classmethod
+    def from_session(cls, state: dict) -> "ItauClient":
+        """Rebuild a client from export_session() — e.g. in a second stateless
+        request that submits the code the user typed."""
+        c = cls()
+        for ck in state.get("cookies", []):
+            c._http.cookies.set(ck["name"], ck["value"], domain=ck["domain"], path=ck["path"])
+        c._csrf = state.get("csrf", "")
+        c._pending_2fa = state.get("pending_2fa")
+        return c
+
+    def _require_pending(self) -> dict:
+        if not self._pending_2fa:
+            raise ItauAuthError("No login is waiting on a second factor.")
+        return self._pending_2fa
 
     def get_credit_card_payload(
         self,
@@ -322,42 +323,19 @@ class ItauClient:
     def _load_dashboard(self) -> None:
         r = self._http.get(TRX + "/")
         if r.is_redirect and "inicio-seguro" in r.headers.get("location", ""):
-            challenge: dict = {}
-            try:
-                url = r.headers["location"]
-                chain: list[str] = []
-                page = self._http.get(url)
-                while page.is_redirect and len(chain) < 5:
-                    url = page.headers.get("location", "")
-                    # Path + query *keys* only — values can carry session state.
-                    u = httpx.URL(url)
-                    chain.append(f"{page.status_code} -> {u.path}" + (f"?{','.join(k for k, _ in u.params.multi_items())}" if u.params else ""))
-                    page = self._http.get(url)
-                challenge = {"status": page.status_code, "redirect_chain": chain, "final_path": httpx.URL(url).path,
-                             **_describe_challenge(page.text)}
-                # The form may be built client-side — scan same-origin scripts too
-                # (static assets, no session data) for the endpoints it calls.
-                script_paths: dict[str, list[str]] = {}
-                same_origin = [
-                    s.replace(BASE_URL, "", 1) for s in challenge.get("script_srcs", [])
-                    if s.startswith("/") or s.startswith(BASE_URL)
-                ]
-                # Only Itaú's own app scripts — skip vendor libs (jquery, bootstrap, ...).
-                app_js = [s for s in same_origin if "/components/" in s or "main.js" in s or "functions.js" in s]
-                for src in app_js[:8]:
-                    try:
-                        js = self._http.get(src).text
-                        found = sorted(set(re.findall(r"""/trx/[A-Za-z0-9_\-/.]+|['"][a-zA-Z/]*(?:sms|token|segur|validar)[a-zA-Z/]*['"]""", js, re.I)))
-                        if found:
-                            script_paths[src] = found[:40]
-                    except httpx.HTTPError:
-                        continue
-                challenge["script_endpoints"] = script_paths
-            except httpx.HTTPError as e:
-                challenge = {"fetch_error": type(e).__name__}
+            page = self._http.get(r.headers["location"])
+            info = _parse_second_factor_page(page.text) if page.status_code == 200 else {}
+            if not info.get("operation_id"):
+                raise ItauAuthError(
+                    f"Itaú asked for a second factor but the token page couldn't be read "
+                    f"(HTTP {page.status_code}). Log out of other Itaú sessions and retry."
+                )
+            self._csrf = info["csrf"] or self._csrf
+            self._pending_2fa = {k: info[k] for k in ("operation_id", "token_types", "phone_masked")}
             raise ItauTwoFactorRequired(
-                "Itaú requires a second factor (iToken/SMS) for this device/session.",
-                challenge=challenge,
+                "Itaú requires a second factor (iToken/SMS) for this device.",
+                token_types=info["token_types"],
+                phone_masked=info["phone_masked"],
             )
         r.raise_for_status()
         html = r.text
