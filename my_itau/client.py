@@ -19,6 +19,7 @@ import json
 import logging
 import re
 from datetime import date
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 import httpx
@@ -61,10 +62,63 @@ class ItauNoHistoric(Exception):
 class ItauTwoFactorRequired(Exception):
     """Login succeeded (credentials were correct) but Itaú doesn't recognize
     this device/session and is demanding a second factor (iToken) before
-    granting dashboard access — redirects to /trx/inicio-seguro. There is no
-    step2 API yet; this just fails cleanly instead of crashing on the
-    redirected response's raise_for_status()."""
-    pass
+    granting dashboard access — redirects to /trx/inicio-seguro.
+
+    `challenge` is a structural description of the 2FA page (form actions,
+    field names, select options, /trx/ endpoints referenced in scripts) with
+    all field *values* redacted — safe to log, used to reverse-engineer the
+    step-2 submission."""
+
+    def __init__(self, message: str, challenge: Optional[dict] = None):
+        super().__init__(message)
+        self.challenge = challenge or {}
+
+
+class _ChallengeParser(HTMLParser):
+    """Collects form structure only — never field values (except <option>s,
+    which are the method choices like ITOKEN/SMS, not user data)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: list[dict] = []
+        self.scripts: list[str] = []
+        self._select: Optional[dict] = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            self.forms.append({"action": a.get("action"), "method": a.get("method"), "id": a.get("id"), "fields": []})
+        elif tag in ("input", "button", "textarea") and self.forms:
+            self.forms[-1]["fields"].append({
+                "tag": tag, "type": a.get("type"), "name": a.get("name"), "id": a.get("id"),
+                "has_value": bool(a.get("value")),
+            })
+        elif tag == "select":
+            self._select = {"tag": "select", "name": a.get("name"), "id": a.get("id"), "options": []}
+            (self.forms[-1]["fields"] if self.forms else []).append(self._select)
+        elif tag == "option" and self._select is not None:
+            self._select["options"].append(a.get("value"))
+        elif tag == "script" and a.get("src"):
+            self.scripts.append(a["src"])
+
+    def handle_endtag(self, tag):
+        if tag == "select":
+            self._select = None
+
+
+def _describe_challenge(html: str) -> dict:
+    p = _ChallengeParser()
+    try:
+        p.feed(html)
+    except Exception:  # noqa: BLE001 — recon only, never block on parse errors
+        pass
+    return {
+        "forms": p.forms,
+        "script_srcs": p.scripts,
+        "trx_paths": sorted(set(re.findall(r"""/trx/[A-Za-z0-9_\-/.]+""", html))),
+        "mentions": sorted({w for w in ("sms", "itoken", "token", "otp", "codigo", "celular")
+                            if w in html.lower()}),
+    }
 
 
 class ItauClient:
@@ -223,9 +277,27 @@ class ItauClient:
     def _load_dashboard(self) -> None:
         r = self._http.get(TRX + "/")
         if r.is_redirect and "inicio-seguro" in r.headers.get("location", ""):
+            challenge: dict = {}
+            try:
+                page = self._http.get(r.headers["location"])
+                challenge = {"status": page.status_code, **_describe_challenge(page.text)}
+                # The form may be built client-side — scan same-origin scripts too
+                # (static assets, no session data) for the endpoints it calls.
+                script_paths: dict[str, list[str]] = {}
+                for src in [s for s in challenge.get("script_srcs", []) if s.startswith("/")][:8]:
+                    try:
+                        js = self._http.get(src).text
+                        found = sorted(set(re.findall(r"""/trx/[A-Za-z0-9_\-/.]+|['"][a-zA-Z/]*(?:sms|token|segur|validar)[a-zA-Z/]*['"]""", js, re.I)))
+                        if found:
+                            script_paths[src] = found[:40]
+                    except httpx.HTTPError:
+                        continue
+                challenge["script_endpoints"] = script_paths
+            except httpx.HTTPError as e:
+                challenge = {"fetch_error": type(e).__name__}
             raise ItauTwoFactorRequired(
-                "Itaú requires a second factor (iToken) for this device/session — "
-                "not yet supported."
+                "Itaú requires a second factor (iToken/SMS) for this device/session.",
+                challenge=challenge,
             )
         r.raise_for_status()
         html = r.text
