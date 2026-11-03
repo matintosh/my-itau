@@ -82,6 +82,9 @@ class _ChallengeParser(HTMLParser):
         super().__init__()
         self.forms: list[dict] = []
         self.scripts: list[str] = []
+        self.inline_js: list[str] = []
+        self.csrf_header_name: Optional[str] = None
+        self._in_inline_script = False
         self._select: Optional[dict] = None
 
     def handle_starttag(self, tag, attrs):
@@ -98,12 +101,46 @@ class _ChallengeParser(HTMLParser):
             (self.forms[-1]["fields"] if self.forms else []).append(self._select)
         elif tag == "option" and self._select is not None:
             self._select["options"].append(a.get("value"))
-        elif tag == "script" and a.get("src"):
-            self.scripts.append(a["src"])
+        elif tag == "script":
+            if a.get("src"):
+                self.scripts.append(a["src"])
+            else:
+                self._in_inline_script = True
+        elif tag == "meta" and a.get("name") == "_csrf_header":
+            self.csrf_header_name = a.get("content")  # a header *name*, not a secret
+
+    def handle_data(self, data):
+        if getattr(self, "_in_inline_script", False):
+            self.inline_js.append(data)
 
     def handle_endtag(self, tag):
         if tag == "select":
             self._select = None
+        elif tag == "script":
+            self._in_inline_script = False
+
+
+_INTERESTING_JS = ("validar-token", "loadTokensOptions", "tokens/operations", "generar-token", "select-token", "load-token")
+
+
+def _redact_js(snippet: str) -> str:
+    # Keep code structure (field names, URLs, call shapes); drop anything that
+    # could be user/session data: quoted strings with digits, then any digit run.
+    snippet = re.sub(r"""(['"])(?=[^'"]*\d[^'"]*\d)[^'"]{2,}\1""", r"\1<redacted>\1", snippet)
+    return re.sub(r"\d{3,}", "<n>", snippet)
+
+
+def _inline_js_snippets(chunks: list[str]) -> list[str]:
+    js = "\n".join(chunks)
+    out = []
+    for kw in _INTERESTING_JS:
+        for m in re.finditer(re.escape(kw), js):
+            snip = _redact_js(js[max(0, m.start() - 700): m.end() + 700])
+            if snip not in out:
+                out.append(snip)
+            if len(out) >= 10:
+                return out
+    return out
 
 
 def _describe_challenge(html: str) -> dict:
@@ -112,12 +149,20 @@ def _describe_challenge(html: str) -> dict:
         p.feed(html)
     except Exception:  # noqa: BLE001 — recon only, never block on parse errors
         pass
+    html_snips = []
+    for kw in ("section-token", "generar-token", "select-token"):
+        i = html.find(kw)
+        if i != -1:
+            html_snips.append(_redact_js(html[max(0, i - 400): i + 900]))
     return {
         "forms": p.forms,
         "script_srcs": p.scripts,
+        "csrf_header_name": p.csrf_header_name,
         "trx_paths": sorted(set(re.findall(r"""/trx/[A-Za-z0-9_\-/.]+""", html))),
         "mentions": sorted({w for w in ("sms", "itoken", "token", "otp", "codigo", "celular")
                             if w in html.lower()}),
+        "inline_js": _inline_js_snippets(p.inline_js),
+        "html_snippets": html_snips,
     }
 
 
@@ -150,7 +195,7 @@ class ItauClient:
 
     def login(self, document_number: str, password: str) -> None:
         """Authenticate. Raises ItauAuthError on bad credentials."""
-        logger.info("Logging in as %s", document_number)
+        logger.info("Logging in as ••%s", document_number[-3:])
         self._prime_session()
         redirect = self._do_login(document_number, password)
         logger.debug("Login redirect → %s", redirect)
@@ -284,7 +329,13 @@ class ItauClient:
                 # The form may be built client-side — scan same-origin scripts too
                 # (static assets, no session data) for the endpoints it calls.
                 script_paths: dict[str, list[str]] = {}
-                for src in [s for s in challenge.get("script_srcs", []) if s.startswith("/")][:8]:
+                same_origin = [
+                    s.replace(BASE_URL, "", 1) for s in challenge.get("script_srcs", [])
+                    if s.startswith("/") or s.startswith(BASE_URL)
+                ]
+                # Only Itaú's own app scripts — skip vendor libs (jquery, bootstrap, ...).
+                app_js = [s for s in same_origin if "/components/" in s or "main.js" in s or "functions.js" in s]
+                for src in app_js[:8]:
                     try:
                         js = self._http.get(src).text
                         found = sorted(set(re.findall(r"""/trx/[A-Za-z0-9_\-/.]+|['"][a-zA-Z/]*(?:sms|token|segur|validar)[a-zA-Z/]*['"]""", js, re.I)))
