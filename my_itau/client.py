@@ -150,7 +150,7 @@ def _describe_challenge(html: str) -> dict:
     except Exception:  # noqa: BLE001 — recon only, never block on parse errors
         pass
     html_snips = []
-    for kw in ("section-token", "generar-token", "select-token"):
+    for kw in ("section-token", "generar-token", "select-token", "validar-token", "data-flujo", "loadTokensOptions"):
         i = html.find(kw)
         if i != -1:
             html_snips.append(_redact_js(html[max(0, i - 400): i + 900]))
@@ -324,8 +324,17 @@ class ItauClient:
         if r.is_redirect and "inicio-seguro" in r.headers.get("location", ""):
             challenge: dict = {}
             try:
-                page = self._http.get(r.headers["location"])
-                challenge = {"status": page.status_code, **_describe_challenge(page.text)}
+                url = r.headers["location"]
+                chain: list[str] = []
+                page = self._http.get(url)
+                while page.is_redirect and len(chain) < 5:
+                    url = page.headers.get("location", "")
+                    # Path + query *keys* only — values can carry session state.
+                    u = httpx.URL(url)
+                    chain.append(f"{page.status_code} -> {u.path}" + (f"?{','.join(k for k, _ in u.params.multi_items())}" if u.params else ""))
+                    page = self._http.get(url)
+                challenge = {"status": page.status_code, "redirect_chain": chain, "final_path": httpx.URL(url).path,
+                             **_describe_challenge(page.text)}
                 # The form may be built client-side — scan same-origin scripts too
                 # (static assets, no session data) for the endpoints it calls.
                 script_paths: dict[str, list[str]] = {}
