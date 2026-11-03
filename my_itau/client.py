@@ -58,6 +58,15 @@ class ItauNoHistoric(Exception):
     pass
 
 
+class ItauTwoFactorRequired(Exception):
+    """Login succeeded (credentials were correct) but Itaú doesn't recognize
+    this device/session and is demanding a second factor (iToken) before
+    granting dashboard access — redirects to /trx/inicio-seguro. There is no
+    step2 API yet; this just fails cleanly instead of crashing on the
+    redirected response's raise_for_status()."""
+    pass
+
+
 class ItauClient:
     """Stateful HTTP client for itaulink.com.uy. One instance = one login session."""
 
@@ -213,6 +222,11 @@ class ItauClient:
 
     def _load_dashboard(self) -> None:
         r = self._http.get(TRX + "/")
+        if r.is_redirect and "inicio-seguro" in r.headers.get("location", ""):
+            raise ItauTwoFactorRequired(
+                "Itaú requires a second factor (iToken) for this device/session — "
+                "not yet supported."
+            )
         r.raise_for_status()
         html = r.text
 
