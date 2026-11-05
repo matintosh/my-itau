@@ -183,6 +183,24 @@ class ItauClient:
         self._load_dashboard()
         self._load_credit_cards()
 
+    def is_logged_in(self) -> bool:
+        """Cheap authenticated check (one GET of the dashboard). Also keeps the
+        Itaú session from idling out."""
+        try:
+            r = self._http.get(TRX + "/")
+        except httpx.HTTPError:
+            return False
+        return r.status_code == 200 and "var mensajeUsuario = JSON.parse" in r.text
+
+    def reload(self) -> None:
+        """Re-read accounts, CSRF and the card list on an already-authenticated
+        session — required after from_session(), which restores cookies but not
+        those lists. Raises ItauSessionExpired if the session is gone."""
+        if not self.is_logged_in():
+            raise ItauSessionExpired("The Itaú session is no longer authenticated.")
+        self._load_dashboard()
+        self._load_credit_cards()
+
     def export_session(self) -> dict:
         """Serializable snapshot of the live session (cookies, CSRF, any parked
         second-factor step). Treat as a credential — it IS one, for ~20 min."""
@@ -196,7 +214,9 @@ class ItauClient:
     @classmethod
     def from_session(cls, state: dict) -> "ItauClient":
         """Rebuild a client from export_session() — e.g. in a second stateless
-        request that submits the code the user typed."""
+        request that submits the code the user typed. Restores cookies, CSRF and
+        any parked second-factor step, NOT accounts/cards: call reload() before
+        reading data from a restored, already-logged-in session."""
         c = cls()
         for ck in state.get("cookies", []):
             c._http.cookies.set(ck["name"], ck["value"], domain=ck["domain"], path=ck["path"])
