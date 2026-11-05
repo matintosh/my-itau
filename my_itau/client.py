@@ -386,7 +386,7 @@ class ItauClient:
 
         cuentas = user_data.get("cuentas", {})
         self.accounts = [
-            self._normalise_account(a)
+            self._normalise_account(a, key)
             for key in (
                 "CAJA_DE_AHORRO",
                 "CUENTA_CORRIENTE",
@@ -471,8 +471,11 @@ class ItauClient:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _normalise_account(raw: dict) -> dict:
+    def _normalise_account(raw: dict, group: str | None = None) -> dict:
         return {
+            # Which section of Itaú's dashboard it came from: CAJA_DE_AHORRO,
+            # CUENTA_CORRIENTE, ... (tipoCuenta alone is just a numeric code).
+            "group": group,
             "type": raw.get("tipoCuenta"),
             "id": raw.get("idCuenta"),
             "holder": raw.get("nombreTitular"),
@@ -480,6 +483,7 @@ class ItauClient:
             "balance": raw.get("saldo"),
             "hash": raw.get("hash"),
             "customer_hash": raw.get("hashCustomer"),
+            "raw": raw,
         }
 
     @staticmethod
