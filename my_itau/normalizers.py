@@ -18,6 +18,7 @@ _CURRENCY_MAP = {
     "euros": "EUR",
     "reales": "BRL",
     # Account-level currency codes Itaú uses (not ISO 4217)
+    "urgp": "UYU",
     "us.d": "USD",
     "u$s": "USD",
     "u$": "USD",
