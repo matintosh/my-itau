@@ -41,6 +41,14 @@ ERROR_CODES: dict[str, str] = {
     "10030": "Account blocked",
 }
 
+
+def _json(r: httpx.Response):
+    """Parse a JSON response using the charset Itaú declares. Its endpoints answer
+    `application/json;charset=ISO-8859-1`, but httpx's Response.json() ignores the
+    charset and assumes UTF-8, so any accented byte (an "Ê" in a description) raised
+    UnicodeDecodeError and the whole account came back empty. r.text honours it."""
+    return json.loads(r.text)
+
 class ItauAuthError(Exception):
     """Login/authentication failure. `code` is Itaú's numeric message_code
     (see ERROR_CODES) when available, so callers can distinguish e.g. a
@@ -158,7 +166,7 @@ class ItauClient:
             str(httpx.QueryParams({"operationId": p["operation_id"], "tokenType": "SMS_TOKEN"})).encode(),
         )
         r.raise_for_status()
-        err = (r.json().get("itaulink_msg", {}).get("data", {}) or {}).get("errorMsg")
+        err = (_json(r).get("itaulink_msg", {}).get("data", {}) or {}).get("errorMsg")
         if err:
             raise ItauAuthError(f"Itaú couldn't send the SMS: {err}")
 
@@ -175,7 +183,7 @@ class ItauClient:
         if r.is_redirect:
             raise ItauSessionExpired("The second-factor step expired — start the login again.")
         r.raise_for_status()
-        data = (r.json().get("itaulink_msg", {}) or {}).get("data", {}) or {}
+        data = (_json(r).get("itaulink_msg", {}) or {}).get("data", {}) or {}
         if "operacion_aprobada" not in data:
             msg = data.get("errorAlert") or data.get("error") or "Itaú rejected the code."
             raise ItauAuthError(re.sub(r"<[^>]+>", "", str(msg)).strip(), code="second_factor_rejected")
@@ -250,7 +258,7 @@ class ItauClient:
         )
         self._check_session(r)
         r.raise_for_status()
-        data = r.json()
+        data = _json(r)
         if isinstance(data, dict) and "itaulink_msg" in data:
             return data["itaulink_msg"]
         return data
@@ -284,7 +292,7 @@ class ItauClient:
         r = self._ajax_post(url, b"{}")
         self._check_session(r)
         r.raise_for_status()
-        data = r.json()
+        data = _json(r)
         auths = (
             data.get("itaulink_msg", data)
                 .get("data", {})
@@ -405,7 +413,7 @@ class ItauClient:
             return
 
         try:
-            payload = r.json()
+            payload = _json(r)
         except Exception as e:
             logger.warning("Could not parse CC list response: %s", e)
             return
@@ -449,7 +457,7 @@ class ItauClient:
             )
             if r.status_code == 200:
                 datos = (
-                    r.json().get("itaulink_msg", {}).get("data", {}).get("datos", {})
+                    _json(r).get("itaulink_msg", {}).get("data", {}).get("datos", {})
                 )
                 imagen = datos.get("imagen")
                 product = (datos.get("datosAdicionales") or {}).get("tipo")
@@ -520,7 +528,7 @@ class ItauClient:
         r = self._ajax_post(url, b"{}")
         self._check_session(r)
         r.raise_for_status()
-        moves = self._unwrap_cc_moves(r.json(), historic=False)
+        moves = self._unwrap_cc_moves(_json(r), historic=False)
         # Endpoint returns account-wide data regardless of URL hash; filter only if caller specified one.
         if card_hash:
             return [m for m in moves if m.get("tarjeta", {}).get("hash") == card_hash]
@@ -573,7 +581,7 @@ class ItauClient:
         r = self._ajax_post(url, b"{}")
         self._check_session(r)
         r.raise_for_status()
-        data = r.json()
+        data = _json(r)
         try:
             return data["itaulink_msg"]["data"]["movimientosMesActual"]["movimientos"]
         except (KeyError, TypeError):
@@ -590,7 +598,7 @@ class ItauClient:
             # session expiry (marker present) still raises ItauSessionExpired.
             return []
         r.raise_for_status()
-        data = r.json()
+        data = _json(r)
         try:
             return data["itaulink_msg"]["data"]["mapaHistoricos"]["movimientosHistoricos"]["movimientos"]
         except (KeyError, TypeError):
